@@ -194,7 +194,6 @@ void startMidiPlayback(void);
 void stopMidiPlayback(void);
 void updateMidiPlayback(void);
 void handleMidiEvent(const MidiEvent* ev);
-int findHighestActiveMidiNote(void);
 
 //---------------------------------------------------------------
 //  ESP32-C6初期化
@@ -1083,17 +1082,9 @@ void handleMidiEvent(const MidiEvent* ev) {
       midiActiveNotes[ev->note]--;
     }
     if (currentMidiNote == ev->note && midiActiveNotes[ev->note] == 0) {
-      currentMidiNote = findHighestActiveMidiNote();
+      // Monophonic behavior: when the current note is released, stop sound.
+      // This avoids resurrecting older sustained notes that make playback sound stretched.
+      currentMidiNote = -1;
     }
   }
-}
-
-//---------------------------------------------------------------
-//  発音中ノート探索
-//---------------------------------------------------------------
-int findHighestActiveMidiNote(void) {
-  for (int n = 127; n >= 0; n--) {
-    if (midiActiveNotes[n] > 0) return n;
-  }
-  return -1;
 }
