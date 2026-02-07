@@ -1,37 +1,44 @@
 //***************************************************************
-//  Stylophone Emulator 0.0.1 ƒƒCƒ“ƒvƒƒOƒ‰ƒ€ 
-//                                          2026/02/06 T. Kawabata
+//  Stylophone Emulator 0.0.1 ãƒ¡ã‚¤ãƒ³ãƒ—ãƒ­ã‚°ãƒ©ãƒ 
+//                                          2026/02/07 T. Kawabata
 //
-//  2026/02/05  Sample. 01 F‘‚«‚İŠm”F,ƒXƒs[ƒJ[“®ìŠm”F
-//  2026/02/05  Sample. 02 Fƒsƒ“Šm”F
-//  2026/02/05  Sample. 03 FADC,ƒVƒŠƒAƒ‹’Ç‰Á
-//  2026/02/06  Sample. 04 FADCƒXƒCƒbƒ`’Ç‰Á
-//  2026/02/06  Sample. 05 FADCƒXƒCƒbƒ`Œ®”Õ‰»
-//  2026/02/07  Sample. 06 Fƒrƒuƒ‰[ƒg’Ç‰Á
+//  2026/02/05  Sample. 01 ï¼šæ›¸ãè¾¼ã¿ç¢ºèª,ã‚¹ãƒ”ãƒ¼ã‚«ãƒ¼å‹•ä½œç¢ºèª
+//  2026/02/05  Sample. 02 ï¼šãƒ”ãƒ³ç¢ºèª
+//  2026/02/05  Sample. 03 ï¼šADC,ã‚·ãƒªã‚¢ãƒ«è¿½åŠ 
+//  2026/02/06  Sample. 04 ï¼šADCã‚¹ã‚¤ãƒƒãƒè¿½åŠ 
+//  2026/02/06  Sample. 05 ï¼šADCã‚¹ã‚¤ãƒƒãƒéµç›¤åŒ–
+//  2026/02/07  Sample. 06 ï¼šãƒ“ãƒ–ãƒ©ãƒ¼ãƒˆè¿½åŠ 
+//  2026/02/07  Sample. 07 ï¼šMODE_PIN=LOWã§SPIFFS MIDIå†ç”Ÿ
 //
 //***************************************************************
 #include <Arduino.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
 
 //-------------------------------------------------------------------------
-//  ƒ|[ƒg’è‹`
+//  ãƒãƒ¼ãƒˆå®šç¾©
 //-------------------------------------------------------------------------
 #define SW_ADC_PIN 0   // GPIO0 = ADC1_CH0
 #define BUZZER_PIN 7
 #define VIB_PIN    10
+#define MODE_PIN   11  // é…ç·šã«åˆã‚ã›ã¦å¤‰æ›´
 #define DOS5_PIN   21
 #define RE5_PIN    22
 #define MI5_PIN    23
 static const uint8_t adcPins[7] = {0, 1, 2, 3, 4, 5, 6};
 
 //-------------------------------------------------------------------------
-//  ƒ}ƒNƒ’è‹`
+//  ãƒã‚¯ãƒ­å®šç¾©
 //-------------------------------------------------------------------------
 int melody[] = {175,185,195,208,220,233,247,262,277,294,311,330,349,370,392,415,440,466,494,523,554,587,622,659}; // F3~E5
-static const int MV_NONE = 3340;  // Šú‘Ò’l(mV)
-static const int MV_SW2  = 320;   // Šú‘Ò’l(mV)
-static const int MV_SW1  = 1280;  // Šú‘Ò’l(mV)
-static const int MV_SW0  = 2368;  // Šú‘Ò’l(mV)
-static const int TOL_MV = 120;       // ‹–—e•(mV) (’ïRŒë·/ƒmƒCƒY•ªB•K—v‚É‰‚¶‚Ä’²®)
+static const int MV_NONE = 3340;  // æœŸå¾…å€¤(mV)
+static const int MV_SW2  = 320;   // æœŸå¾…å€¤(mV)
+static const int MV_SW1  = 1280;  // æœŸå¾…å€¤(mV)
+static const int MV_SW0  = 2368;  // æœŸå¾…å€¤(mV)
+static const int TOL_MV = 120;    // è¨±å®¹å¹…(mV)
 int chMax = 7;
 static const char* const chSw[7][3] = {
   { "RE4" , "RES4" , "MI4" },
@@ -42,7 +49,7 @@ static const char* const chSw[7][3] = {
   { "SOS3" , "RA3" , "RAS3"},
   { "SHI3" , "DO4" , "DOS4"}
 };
-static const int SW_STABLE_COUNT = 2;   // 2‰ñ˜A‘±‚Å“¯‚¶”»’è‚È‚çŠm’è(100msüŠú‚È‚ç200ms)
+static const int SW_STABLE_COUNT = 2;   // 2å›é€£ç¶šã§åŒã˜åˆ¤å®šãªã‚‰ç¢ºå®š(20mså‘¨æœŸãªã‚‰40ms)
 static const uint8_t adcNoteIdx[7][3] = {
   {  9, 10, 11 }, // ch0: RE4, RES4, MI4
   { 12, 13, 14 }, // ch1: FA4, FAS4, SO4
@@ -52,43 +59,145 @@ static const uint8_t adcNoteIdx[7][3] = {
   {  3,  4,  5 }, // ch5: SOS3, RA3, RAS3
   {  6,  7,  8 }  // ch6: SHI3, DO4, DOS4
 };
-
+static const uint8_t DIGITAL_NOTE_BASE = 21; // DOS5/RE5/MI5
+static const uint32_t DEFAULT_TEMPO_US_PER_QN = 500000UL;
+static const size_t MAX_SONGS = 32;
 
 //---------------------------------------------------------------
-//  ƒOƒ[ƒoƒ‹•Ï”’è‹`
+//  MIDIç”¨æ§‹é€ ä½“
+//---------------------------------------------------------------
+enum MidiEventType : uint8_t {
+  MIDI_NOTE_OFF = 0,
+  MIDI_NOTE_ON  = 1
+};
+
+struct MidiSongInfo {
+  char path[96];
+  char name[64];
+};
+
+struct MidiEvent {
+  uint32_t tick;
+  uint32_t timeUs;
+  uint8_t type;     // MIDI_NOTE_ON / MIDI_NOTE_OFF
+  uint8_t note;     // 0..127
+  uint8_t velocity; // 0..127
+};
+
+struct TempoEvent {
+  uint32_t tick;
+  uint32_t usPerQuarter;
+};
+
+//---------------------------------------------------------------
+//  ã‚°ãƒ­ãƒ¼ãƒãƒ«å¤‰æ•°å®šç¾©
 //---------------------------------------------------------------
 const uint32_t DEBOUNCE_MS = 10;
 int currentFreq = -1;
 static bool lastVibEnabled = false;
-// ƒfƒWƒ^ƒ‹3ƒ{ƒ^ƒ“—pƒfƒoƒEƒ“ƒX
+static bool songMode = false;
+
+// ãƒ‡ã‚¸ã‚¿ãƒ«3ãƒœã‚¿ãƒ³ç”¨ãƒ‡ãƒã‚¦ãƒ³ã‚¹
 uint8_t lastRaw = 0xFF;
 uint8_t stableRaw = 0xFF;
+uint8_t prevStableRaw = 0xFF;
 uint32_t lastChangeMs = 0;
-// ƒ^ƒCƒ}/ƒZƒ}ƒtƒH
+
+// ã‚¿ã‚¤ãƒ/ã‚»ãƒãƒ•ã‚©
 hw_timer_t *timer0 = nullptr;
 volatile SemaphoreHandle_t sampleSem;
-// ADCŒ®”Õ‚ÌˆÀ’è”»’è
-static int swStable[7]     = {3, 3, 3, 3, 3, 3, 3};   // Šm’èó‘Ô(0..2, 3, -1)
-static int swCandidate[7]  = {3, 3, 3, 3, 3, 3, 3};   // Œó•â
-static uint8_t swCnt[7]    = {0, 0, 0, 0, 0, 0, 0};   // ˜A‘±ˆê’v‰ñ”
-// ADCŒ®”Õ‚Å–Â‚ç‚·ü”g”(ƒfƒWƒ^ƒ‹–¢‰Ÿ‰º‚Ég—p)
+
+// ADCéµç›¤ã®å®‰å®šåˆ¤å®š
+static int swStable[7]     = {3, 3, 3, 3, 3, 3, 3};   // ç¢ºå®šçŠ¶æ…‹(0..2, 3, -1)
+static int swCandidate[7]  = {3, 3, 3, 3, 3, 3, 3};   // å€™è£œ
+static uint8_t swCnt[7]    = {0, 0, 0, 0, 0, 0, 0};   // é€£ç¶šä¸€è‡´å›æ•°
+
+// ADCéµç›¤ã§é³´ã‚‰ã™å‘¨æ³¢æ•°(ãƒ‡ã‚¸ã‚¿ãƒ«æœªæŠ¼ä¸‹æ™‚ã«ä½¿ç”¨)
 volatile int adcFreq = 0;
-volatile int adcActiveCh = -1; // ‰Ÿ‰º’†‚Ìch(ÅŒã‚ÉŠm’è‚µ‚½‰Ÿ‰º)
-volatile int adcActiveSw = -1; // ‰Ÿ‰º’†‚Ìsw(0..2)
-static const uint32_t VIBRATO_PERIOD_MS = 167;    // about 6Hz
-static const int VIBRATO_DEPTH_PERMILLE = 25;     // +/-2.5%
-//---------------------------------------------------------------
-//  ŠÖ”ƒvƒƒgƒ^ƒCƒvéŒ¾
-//---------------------------------------------------------------
-int freqFromButtons( uint8_t raw );
-void ARDUINO_ISR_ATTR onTimer( void );
-void updateBuzzerNonBlocking( void );
-int classifySwitchMv(int mv);
-void printSwitchPressedOnce( int ch, int sw );
-int applyVibrato( int baseFreq, uint32_t nowMs );
+volatile int adcActiveCh = -1; // æŠ¼ä¸‹ä¸­ã®ch(æœ€å¾Œã«ç¢ºå®šã—ãŸæŠ¼ä¸‹)
+volatile int adcActiveSw = -1; // æŠ¼ä¸‹ä¸­ã®sw(0..2)
+
+// æ›²ãƒ¢ãƒ¼ãƒ‰ã®éµç›¤ã‚¤ãƒ™ãƒ³ãƒˆ
+static int pendingKeyPress = -1;
+
+// Vibrato
+static const uint32_t VIBRATO_PERIOD_MS = 167; // about 6Hz
+static const int VIBRATO_DEPTH_PERMILLE = 25;  // +/-2.5%
+
+// MIDIæ›²ç®¡ç†
+static MidiSongInfo midiSongs[MAX_SONGS];
+static size_t midiSongCount = 0;
+static bool spiffsReady = false;
+static int selectedSongIndex = -1;
+
+// MIDIãƒ‡ãƒ¼ã‚¿(ç¾åœ¨èª­ã¿è¾¼ã‚“ã 1æ›²åˆ†)
+static MidiEvent* midiEvents = nullptr;
+static size_t midiEventCount = 0;
+static size_t midiEventCap = 0;
+
+static TempoEvent* tempoEvents = nullptr;
+static size_t tempoEventCount = 0;
+static size_t tempoEventCap = 0;
+
+static uint16_t midiDivision = 480;
+static int loadedSongIndex = -1;
+
+// MIDIå†ç”ŸçŠ¶æ…‹
+static bool midiIsPlaying = false;
+static size_t midiPlayPos = 0;
+static uint32_t midiPlayStartUs = 0;
+static uint8_t midiActiveNotes[128] = {0};
+static int currentMidiNote = -1;
+static volatile int midiPlaybackFreq = 0;
+static int midiFreqTable[128] = {0};
 
 //---------------------------------------------------------------
-//  ESP32-C6‰Šú‰»
+//  é–¢æ•°ãƒ—ãƒ­ãƒˆã‚¿ã‚¤ãƒ—å®£è¨€
+//---------------------------------------------------------------
+int freqFromButtons(uint8_t raw);
+void ARDUINO_ISR_ATTR onTimer(void);
+void processAdcKeys(void);
+void updateBuzzerNonBlocking(void);
+void handleModeChange(bool nextSongMode);
+void processSongModeLogic(void);
+void enqueueKeyPress(int noteIdx);
+int consumeKeyPress(void);
+
+int classifySwitchMv(int mv);
+void printSwitchPressedOnce(int ch, int sw);
+int applyVibrato(int baseFreq, uint32_t nowMs);
+
+void buildMidiFreqTable(void);
+bool initSpiffsAndSongList(void);
+void scanMidiSongs(void);
+void printSongList(void);
+bool pathHasMidExt(const char* path);
+const char* basenameFromPath(const char* path);
+void normalizeSpiffsPath(char* dst, size_t dstSize, const char* folder, const char* rawName);
+
+void resetMidiBuffers(void);
+bool reserveMidiEvents(size_t needCount);
+bool reserveTempoEvents(size_t needCount);
+bool appendMidiEvent(uint32_t tick, uint8_t type, uint8_t note, uint8_t velocity);
+bool appendTempoEvent(uint32_t tick, uint32_t usPerQuarter);
+bool readFileIntoBuffer(const char* path, uint8_t** outBuf, size_t* outLen);
+bool readU16BE(const uint8_t* data, size_t len, size_t* pos, uint16_t* out);
+bool readU32BE(const uint8_t* data, size_t len, size_t* pos, uint32_t* out);
+bool readVLQ(const uint8_t* data, size_t end, size_t* pos, uint32_t* out);
+bool parseMidiBuffer(const uint8_t* data, size_t len);
+void computeEventTimesFromTempo(void);
+int cmpMidiEvent(const void* a, const void* b);
+int cmpTempoEvent(const void* a, const void* b);
+bool loadMidiSongByIndex(size_t songIndex);
+
+void startMidiPlayback(void);
+void stopMidiPlayback(void);
+void updateMidiPlayback(void);
+void handleMidiEvent(const MidiEvent* ev);
+int findHighestActiveMidiNote(void);
+
+//---------------------------------------------------------------
+//  ESP32-C6åˆæœŸåŒ–
 //---------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -100,49 +209,88 @@ void setup() {
   pinMode(RE5_PIN,  INPUT_PULLUP);
   pinMode(MI5_PIN,  INPUT_PULLUP);
   pinMode(VIB_PIN,  INPUT_PULLUP);
+  pinMode(MODE_PIN, INPUT_PULLUP);
 
   // ADC
-  analogReadResolution(12);            // 0..4095 :contentReference[oaicite:5]{index=5}
-  analogSetAttenuation(ADC_11db);      // “ü—ÍƒŒƒ“ƒWŠg‘å(–ÚˆÀ) :contentReference[oaicite:6]{index=6}
+  analogReadResolution(12);       // 0..4095
+  analogSetAttenuation(ADC_11db); // å…¥åŠ›ãƒ¬ãƒ³ã‚¸æ‹¡å¤§(ç›®å®‰)
 
-  // Timer(—á: 100msüŠú‚ÅADC•\¦)
+  // Timer(20mså‘¨æœŸã§ADCéµç›¤åˆ¤å®š)
   sampleSem = xSemaphoreCreateBinary();
-  timer0 = timerBegin(1000000);                 // 1MHz tick :contentReference[oaicite:7]{index=7}
-  timerAttachInterrupt(timer0, &onTimer);       // ISR attach :contentReference[oaicite:8]{index=8}
-  timerAlarm(timer0, 20000, true, 0);          // 100000us=100ms, autoreload :contentReference[oaicite:9]{index=9}
+  timer0 = timerBegin(1000000);           // 1MHz tick
+  timerAttachInterrupt(timer0, &onTimer); // ISR attach
+  timerAlarm(timer0, 20000, true, 0);     // 20000us=20ms, autoreload
+
+  buildMidiFreqTable();
+  spiffsReady = initSpiffsAndSongList();
+
+  songMode = (digitalRead(MODE_PIN) == LOW);
+  Serial.print("Boot Mode: ");
+  Serial.println(songMode ? "SONG" : "PLAY");
 }
 
 //---------------------------------------------------------------
-//  ƒ‹[ƒvŠÖ”
+//  ãƒ«ãƒ¼ãƒ—é–¢æ•°
 //---------------------------------------------------------------
 void loop() {
-  // ‰¹‚Íí‚ÉXV(Œy‚¢ˆ—)
-  updateBuzzerNonBlocking();
+  bool nextSongMode = (digitalRead(MODE_PIN) == LOW);
+  if (nextSongMode != songMode) {
+    handleModeChange(nextSongMode);
+  }
 
-  // ƒ^ƒCƒ}‚Å‹N°‚µ‚½‚çADC‚ğ“Ç‚ñ‚Å•\¦
   if (xSemaphoreTake(sampleSem, 0) == pdTRUE) {
+    processAdcKeys();
+  }
+
+  if (songMode) {
+    processSongModeLogic();
+  } else {
+    midiPlaybackFreq = 0;
+  }
+
+  updateBuzzerNonBlocking();
+}
+
+//---------------------------------------------------------------
+//  ãƒ¢ãƒ¼ãƒ‰åˆ‡æ›¿
+//---------------------------------------------------------------
+void handleModeChange(bool nextSongMode) {
+  songMode = nextSongMode;
+  pendingKeyPress = -1;
+
+  if (songMode) {
+    Serial.println("[MODE] SONG");
+    adcFreq = 0;
+  } else {
+    Serial.println("[MODE] PLAY");
+    stopMidiPlayback();
+    selectedSongIndex = -1;
+  }
+  currentFreq = -1;
+}
+
+//---------------------------------------------------------------
+//  ADCéµç›¤ã‚¹ã‚­ãƒ£ãƒ³
+//---------------------------------------------------------------
+void processAdcKeys(void) {
   for (int ch = 0; ch < chMax; ch++) {
     int mv = (int)analogReadMilliVolts(adcPins[ch]);
     int swRaw = classifySwitchMv(mv); // 0..2, 3(NONE), -1(UNKNOWN)
-    if (swRaw == swCandidate[ch]) {// Œó•â‚Ì˜A‘±ˆê’vƒJƒEƒ“ƒg
+
+    if (swRaw == swCandidate[ch]) {
       if (swCnt[ch] < 255) swCnt[ch]++;
     } else {
       swCandidate[ch] = swRaw;
       swCnt[ch] = 1;
     }
 
-    // ˆÀ’è‰ñ”‚É’B‚µ‚½‚çŠm’èó‘Ô‚ğXV
     if (swCnt[ch] >= SW_STABLE_COUNT) {
       int prev = swStable[ch];
-      int now  = swCandidate[ch];
+      int now = swCandidate[ch];
 
       if (now != prev) {
         swStable[ch] = now;
 
-        // o—Íƒ‹[ƒ‹:
-        // - NONE(3)‚É‚È‚Á‚½(—£‚µ‚½)‚Ìo—Í‚Í‚µ‚È‚¢
-        // - 0..2‚Ö‚Ì•Ï‰»‚Ío—Í(‰Ÿ‚µ’¼‚µ/ƒXƒ‰ƒCƒh—¼‘Î‰)
-        // - UNKNOWN(-1)‚Í"WTF"‚¾‚¯(1‰ñ‚¾‚¯)
         if (now == 3) {
           if (adcActiveCh == ch) {
             adcActiveCh = -1;
@@ -152,39 +300,85 @@ void loop() {
         } else if (now == -1) {
           Serial.println("WTF");
         } else {
-          printSwitchPressedOnce(ch, now); // CH‚Æ‰¹–¼‚ğ•\¦
+          printSwitchPressedOnce(ch, now);
           adcActiveCh = ch;
           adcActiveSw = now;
-          adcFreq = melody[ adcNoteIdx[ch][now] ];
+          adcFreq = melody[adcNoteIdx[ch][now]];
+          enqueueKeyPress(adcNoteIdx[ch][now]);
         }
       }
     }
   }
 }
+
+//---------------------------------------------------------------
+//  æ›²ãƒ¢ãƒ¼ãƒ‰å‡¦ç†
+//---------------------------------------------------------------
+void processSongModeLogic(void) {
+  int key = consumeKeyPress();
+  if (key >= 0) {
+    if (!spiffsReady) {
+      Serial.println("SPIFFS not ready.");
+    } else if (midiSongCount == 0) {
+      Serial.println("No MIDI files in /m or /midi");
+    } else {
+      size_t songIndex = (size_t)key % midiSongCount;
+      if (loadMidiSongByIndex(songIndex)) {
+        selectedSongIndex = (int)songIndex;
+        startMidiPlayback();
+        Serial.print("[PLAY] ");
+        Serial.print(midiSongs[songIndex].name);
+        Serial.print("  (key=");
+        Serial.print(key);
+        Serial.print(", idx=");
+        Serial.print(songIndex);
+        Serial.println(")");
+      }
+    }
+  }
+
+  updateMidiPlayback();
 }
 
 //---------------------------------------------------------------
-//  ƒfƒWƒ^ƒ‹3ƒ{ƒ^ƒ“ŠÄ‹(•Ô’l=ü”g”)
+//  éµç›¤æŠ¼ä¸‹ã‚¤ãƒ™ãƒ³ãƒˆç™»éŒ²
 //---------------------------------------------------------------
-int freqFromButtons( uint8_t raw ) {
-  // INPUT_PULLUP‚È‚Ì‚Å‰Ÿ‰º=0
+void enqueueKeyPress(int noteIdx) {
+  if (noteIdx < 0) return;
+  pendingKeyPress = noteIdx;
+}
+
+//---------------------------------------------------------------
+//  éµç›¤æŠ¼ä¸‹ã‚¤ãƒ™ãƒ³ãƒˆå–å¾—
+//---------------------------------------------------------------
+int consumeKeyPress(void) {
+  int key = pendingKeyPress;
+  pendingKeyPress = -1;
+  return key;
+}
+
+//---------------------------------------------------------------
+//  ãƒ‡ã‚¸ã‚¿ãƒ«3ãƒœã‚¿ãƒ³ç›£è¦–(è¿”å€¤=å‘¨æ³¢æ•°)
+//---------------------------------------------------------------
+int freqFromButtons(uint8_t raw) {
+  // INPUT_PULLUPãªã®ã§æŠ¼ä¸‹=0
   if ((raw & (1 << 0)) == 0) return melody[21]; // Do#5
   if ((raw & (1 << 1)) == 0) return melody[22]; // Re5
   if ((raw & (1 << 2)) == 0) return melody[23]; // Mi5
-  return 0; // none
+  return 0;
 }
 
 //---------------------------------------------------------------
-//  ƒ^ƒCƒ}Š„‚è‚İ
+//  ã‚¿ã‚¤ãƒå‰²ã‚Šè¾¼ã¿
 //---------------------------------------------------------------
-void ARDUINO_ISR_ATTR onTimer( void ) {
+void ARDUINO_ISR_ATTR onTimer(void) {
   xSemaphoreGiveFromISR(sampleSem, nullptr);
 }
 
 //---------------------------------------------------------------
-//  ‰¹ŠKXV
+//  å‡ºéŸ³æ›´æ–°
 //---------------------------------------------------------------
-void updateBuzzerNonBlocking( void ) {
+void updateBuzzerNonBlocking(void) {
   uint8_t raw =
     ((digitalRead(DOS5_PIN) ? 1 : 0) << 0) |
     ((digitalRead(RE5_PIN)  ? 1 : 0) << 1) |
@@ -199,11 +393,27 @@ void updateBuzzerNonBlocking( void ) {
     stableRaw = raw;
   }
 
-  int targetFreq = freqFromButtons(stableRaw);
+  // ãƒ‡ã‚¸ã‚¿ãƒ«ãƒœã‚¿ãƒ³ã®æŠ¼ä¸‹ã‚¨ãƒƒã‚¸ã‚’æ›²é¸æŠç”¨ã«ç™»éŒ²
+  if (stableRaw != prevStableRaw) {
+    for (uint8_t bit = 0; bit < 3; bit++) {
+      bool wasReleased = ((prevStableRaw & (1 << bit)) != 0);
+      bool isPressed = ((stableRaw & (1 << bit)) == 0);
+      if (wasReleased && isPressed) {
+        enqueueKeyPress((int)DIGITAL_NOTE_BASE + (int)bit);
+        break;
+      }
+    }
+    prevStableRaw = stableRaw;
+  }
 
-  // •Ï‰»‚¾‚¯XV(“rØ‚ê‚É‚­‚¢)
-  if (targetFreq == 0) {
-    targetFreq = adcFreq;
+  int targetFreq = 0;
+  if (songMode) {
+    targetFreq = midiPlaybackFreq;
+  } else {
+    targetFreq = freqFromButtons(stableRaw);
+    if (targetFreq == 0) {
+      targetFreq = adcFreq;
+    }
   }
 
   bool vibEnabled = (digitalRead(VIB_PIN) == LOW);
@@ -229,7 +439,7 @@ void updateBuzzerNonBlocking( void ) {
 //---------------------------------------------------------------
 //  Vibrato
 //---------------------------------------------------------------
-int applyVibrato( int baseFreq, uint32_t nowMs ) {
+int applyVibrato(int baseFreq, uint32_t nowMs) {
   if (baseFreq <= 0) return 0;
   if (digitalRead(VIB_PIN) != LOW) return baseFreq;
 
@@ -249,9 +459,9 @@ int applyVibrato( int baseFreq, uint32_t nowMs ) {
 }
 
 //---------------------------------------------------------------
-//  ADC“ü—Í”»’è
+//  ADCå…¥åŠ›åˆ¤å®š
 //---------------------------------------------------------------
-int classifySwitchMv( int mv ) {
+int classifySwitchMv(int mv) {
   auto near = [&](int target) -> bool {
     return (mv >= target - TOL_MV) && (mv <= target + TOL_MV);
   };
@@ -264,7 +474,7 @@ int classifySwitchMv( int mv ) {
 }
 
 //---------------------------------------------------------------
-//  ‰Ÿ‚µ‚½uŠÔ‚¾‚¯•\¦
+//  æŠ¼ã—ãŸç¬é–“ã ã‘è¡¨ç¤º
 //---------------------------------------------------------------
 void printSwitchPressedOnce(int ch, int sw) {
   if (sw == 3) return;
@@ -282,4 +492,608 @@ void printSwitchPressedOnce(int ch, int sw) {
   } else {
     Serial.println("N/A");
   }
+}
+
+//---------------------------------------------------------------
+//  MIDIå‘¨æ³¢æ•°ãƒ†ãƒ¼ãƒ–ãƒ«ä½œæˆ
+//---------------------------------------------------------------
+void buildMidiFreqTable(void) {
+  for (int note = 0; note < 128; note++) {
+    float ratio = powf(2.0f, ((float)note - 69.0f) / 12.0f);
+    float freq = 440.0f * ratio;
+    midiFreqTable[note] = (int)(freq + 0.5f);
+  }
+}
+
+//---------------------------------------------------------------
+//  SPIFFSåˆæœŸåŒ–ã¨æ›²ä¸€è¦§å–å¾—
+//---------------------------------------------------------------
+bool initSpiffsAndSongList(void) {
+  if (!SPIFFS.begin(false)) {
+    Serial.println("SPIFFS mount failed.");
+    return false;
+  }
+  scanMidiSongs();
+  printSongList();
+  return true;
+}
+
+//---------------------------------------------------------------
+//  /midi é…ä¸‹ã® .mid åˆ—æŒ™
+//---------------------------------------------------------------
+void scanMidiSongs(void) {
+  midiSongCount = 0;
+  const char* folder = "/m";
+  File dir = SPIFFS.open(folder);
+  if (!dir || !dir.isDirectory()) {
+    folder = "/midi";
+    dir = SPIFFS.open(folder);
+  }
+  if (!dir || !dir.isDirectory()) {
+    Serial.println("Directory '/m' or '/midi' not found.");
+    return;
+  }
+
+  File file = dir.openNextFile();
+  while (file && midiSongCount < MAX_SONGS) {
+    if (!file.isDirectory()) {
+      const char* path = file.name();
+      if (path != nullptr && pathHasMidExt(path)) {
+        normalizeSpiffsPath(
+          midiSongs[midiSongCount].path,
+          sizeof(midiSongs[midiSongCount].path),
+          folder,
+          path
+        );
+
+        const char* base = basenameFromPath(path);
+        strncpy(midiSongs[midiSongCount].name, base, sizeof(midiSongs[midiSongCount].name) - 1);
+        midiSongs[midiSongCount].name[sizeof(midiSongs[midiSongCount].name) - 1] = '\0';
+        midiSongCount++;
+      }
+    }
+    file.close();
+    file = dir.openNextFile();
+  }
+  dir.close();
+}
+
+//---------------------------------------------------------------
+//  æ›²ä¸€è¦§è¡¨ç¤º
+//---------------------------------------------------------------
+void printSongList(void) {
+  Serial.print("MIDI files: ");
+  Serial.println((int)midiSongCount);
+  for (size_t i = 0; i < midiSongCount; i++) {
+    Serial.print("  [");
+    Serial.print((int)i);
+    Serial.print("] ");
+    Serial.println(midiSongs[i].name);
+  }
+}
+
+//---------------------------------------------------------------
+//  æ‹¡å¼µå­åˆ¤å®š(.mid)
+//---------------------------------------------------------------
+bool pathHasMidExt(const char* path) {
+  size_t n = strlen(path);
+  if (n < 4) return false;
+  const char* ext = path + (n - 4);
+  return (ext[0] == '.') &&
+         ((ext[1] == 'm') || (ext[1] == 'M')) &&
+         ((ext[2] == 'i') || (ext[2] == 'I')) &&
+         ((ext[3] == 'd') || (ext[3] == 'D'));
+}
+
+//---------------------------------------------------------------
+//  ãƒ‘ã‚¹ã‹ã‚‰ãƒ•ã‚¡ã‚¤ãƒ«åæŠ½å‡º
+//---------------------------------------------------------------
+const char* basenameFromPath(const char* path) {
+  const char* slash = strrchr(path, '/');
+  if (slash == nullptr) return path;
+  return slash + 1;
+}
+
+//---------------------------------------------------------------
+//  SPIFFSãƒ‘ã‚¹æ­£è¦åŒ–
+//---------------------------------------------------------------
+void normalizeSpiffsPath(char* dst, size_t dstSize, const char* folder, const char* rawName) {
+  if (dst == nullptr || dstSize == 0) return;
+  if (rawName == nullptr || rawName[0] == '\0') {
+    dst[0] = '\0';
+    return;
+  }
+
+  if (rawName[0] == '/') {
+    strncpy(dst, rawName, dstSize - 1);
+    dst[dstSize - 1] = '\0';
+    return;
+  }
+
+  if (folder == nullptr || folder[0] == '\0') {
+    folder = "/";
+  }
+
+  size_t n = 0;
+  if (folder[0] != '/') {
+    if (n < dstSize - 1) dst[n++] = '/';
+  }
+
+  for (size_t i = 0; folder[i] != '\0' && n < dstSize - 1; i++) {
+    dst[n++] = folder[i];
+  }
+
+  if (n > 0 && dst[n - 1] != '/' && n < dstSize - 1) {
+    dst[n++] = '/';
+  }
+
+  for (size_t i = 0; rawName[i] != '\0' && n < dstSize - 1; i++) {
+    dst[n++] = rawName[i];
+  }
+  dst[n] = '\0';
+}
+
+//---------------------------------------------------------------
+//  MIDIãƒãƒƒãƒ•ã‚¡è§£æ”¾
+//---------------------------------------------------------------
+void resetMidiBuffers(void) {
+  if (midiEvents != nullptr) {
+    free(midiEvents);
+    midiEvents = nullptr;
+  }
+  if (tempoEvents != nullptr) {
+    free(tempoEvents);
+    tempoEvents = nullptr;
+  }
+  midiEventCount = 0;
+  midiEventCap = 0;
+  tempoEventCount = 0;
+  tempoEventCap = 0;
+}
+
+//---------------------------------------------------------------
+//  MIDIã‚¤ãƒ™ãƒ³ãƒˆé ˜åŸŸç¢ºä¿
+//---------------------------------------------------------------
+bool reserveMidiEvents(size_t needCount) {
+  if (needCount <= midiEventCap) return true;
+  size_t newCap = (midiEventCap == 0) ? 256 : midiEventCap;
+  while (newCap < needCount) {
+    newCap *= 2;
+  }
+  MidiEvent* p = (MidiEvent*)realloc(midiEvents, newCap * sizeof(MidiEvent));
+  if (p == nullptr) return false;
+  midiEvents = p;
+  midiEventCap = newCap;
+  return true;
+}
+
+//---------------------------------------------------------------
+//  ãƒ†ãƒ³ãƒã‚¤ãƒ™ãƒ³ãƒˆé ˜åŸŸç¢ºä¿
+//---------------------------------------------------------------
+bool reserveTempoEvents(size_t needCount) {
+  if (needCount <= tempoEventCap) return true;
+  size_t newCap = (tempoEventCap == 0) ? 16 : tempoEventCap;
+  while (newCap < needCount) {
+    newCap *= 2;
+  }
+  TempoEvent* p = (TempoEvent*)realloc(tempoEvents, newCap * sizeof(TempoEvent));
+  if (p == nullptr) return false;
+  tempoEvents = p;
+  tempoEventCap = newCap;
+  return true;
+}
+
+//---------------------------------------------------------------
+//  MIDIã‚¤ãƒ™ãƒ³ãƒˆè¿½åŠ 
+//---------------------------------------------------------------
+bool appendMidiEvent(uint32_t tick, uint8_t type, uint8_t note, uint8_t velocity) {
+  if (!reserveMidiEvents(midiEventCount + 1)) return false;
+  midiEvents[midiEventCount].tick = tick;
+  midiEvents[midiEventCount].timeUs = 0;
+  midiEvents[midiEventCount].type = type;
+  midiEvents[midiEventCount].note = note;
+  midiEvents[midiEventCount].velocity = velocity;
+  midiEventCount++;
+  return true;
+}
+
+//---------------------------------------------------------------
+//  ãƒ†ãƒ³ãƒã‚¤ãƒ™ãƒ³ãƒˆè¿½åŠ 
+//---------------------------------------------------------------
+bool appendTempoEvent(uint32_t tick, uint32_t usPerQuarter) {
+  if (!reserveTempoEvents(tempoEventCount + 1)) return false;
+  tempoEvents[tempoEventCount].tick = tick;
+  tempoEvents[tempoEventCount].usPerQuarter = usPerQuarter;
+  tempoEventCount++;
+  return true;
+}
+
+//---------------------------------------------------------------
+//  ãƒ•ã‚¡ã‚¤ãƒ«èª­ã¿è¾¼ã¿
+//---------------------------------------------------------------
+bool readFileIntoBuffer(const char* path, uint8_t** outBuf, size_t* outLen) {
+  *outBuf = nullptr;
+  *outLen = 0;
+
+  char fixedPath[128];
+  normalizeSpiffsPath(fixedPath, sizeof(fixedPath), "/", path);
+
+  File file = SPIFFS.open(fixedPath, "r");
+  if (!file) {
+    Serial.print("Failed to open: ");
+    Serial.println(fixedPath);
+    return false;
+  }
+
+  size_t size = file.size();
+  if (size == 0) {
+    file.close();
+    Serial.println("MIDI file is empty.");
+    return false;
+  }
+
+  uint8_t* buf = (uint8_t*)malloc(size);
+  if (buf == nullptr) {
+    file.close();
+    Serial.println("malloc failed.");
+    return false;
+  }
+
+  size_t readLen = file.read(buf, size);
+  file.close();
+  if (readLen != size) {
+    free(buf);
+    Serial.println("read failed.");
+    return false;
+  }
+
+  *outBuf = buf;
+  *outLen = size;
+  return true;
+}
+
+//---------------------------------------------------------------
+//  16bit BEèª­ã¿å‡ºã—
+//---------------------------------------------------------------
+bool readU16BE(const uint8_t* data, size_t len, size_t* pos, uint16_t* out) {
+  if (*pos + 2 > len) return false;
+  *out = ((uint16_t)data[*pos] << 8) | (uint16_t)data[*pos + 1];
+  *pos += 2;
+  return true;
+}
+
+//---------------------------------------------------------------
+//  32bit BEèª­ã¿å‡ºã—
+//---------------------------------------------------------------
+bool readU32BE(const uint8_t* data, size_t len, size_t* pos, uint32_t* out) {
+  if (*pos + 4 > len) return false;
+  *out = ((uint32_t)data[*pos] << 24) |
+         ((uint32_t)data[*pos + 1] << 16) |
+         ((uint32_t)data[*pos + 2] << 8) |
+         (uint32_t)data[*pos + 3];
+  *pos += 4;
+  return true;
+}
+
+//---------------------------------------------------------------
+//  VLQèª­ã¿å‡ºã—
+//---------------------------------------------------------------
+bool readVLQ(const uint8_t* data, size_t end, size_t* pos, uint32_t* out) {
+  uint32_t value = 0;
+  for (int i = 0; i < 4; i++) {
+    if (*pos >= end) return false;
+    uint8_t b = data[*pos];
+    (*pos)++;
+    value = (value << 7) | (uint32_t)(b & 0x7F);
+    if ((b & 0x80) == 0) {
+      *out = value;
+      return true;
+    }
+  }
+  return false;
+}
+
+//---------------------------------------------------------------
+//  MIDIè§£æ
+//---------------------------------------------------------------
+bool parseMidiBuffer(const uint8_t* data, size_t len) {
+  if (len < 14) return false;
+
+  size_t pos = 0;
+  if (memcmp(data + pos, "MThd", 4) != 0) return false;
+  pos += 4;
+
+  uint32_t headerLen = 0;
+  if (!readU32BE(data, len, &pos, &headerLen)) return false;
+  if (headerLen < 6) return false;
+  if (pos + headerLen > len) return false;
+
+  size_t headerPos = pos;
+  uint16_t formatType = 0;
+  uint16_t trackCount = 0;
+  uint16_t division = 0;
+  if (!readU16BE(data, len, &headerPos, &formatType)) return false;
+  if (!readU16BE(data, len, &headerPos, &trackCount)) return false;
+  if (!readU16BE(data, len, &headerPos, &division)) return false;
+  if (division == 0 || (division & 0x8000) != 0) {
+    Serial.println("Unsupported MIDI division.");
+    return false;
+  }
+  midiDivision = division;
+  pos += headerLen;
+
+  (void)formatType;
+
+  if (!appendTempoEvent(0, DEFAULT_TEMPO_US_PER_QN)) {
+    return false;
+  }
+
+  for (uint16_t tr = 0; tr < trackCount; tr++) {
+    if (pos + 8 > len) return false;
+    if (memcmp(data + pos, "MTrk", 4) != 0) return false;
+    pos += 4;
+
+    uint32_t trLen = 0;
+    if (!readU32BE(data, len, &pos, &trLen)) return false;
+    if (pos + trLen > len) return false;
+
+    size_t trPos = pos;
+    size_t trEnd = pos + trLen;
+    uint32_t tick = 0;
+    uint8_t runningStatus = 0;
+
+    while (trPos < trEnd) {
+      uint32_t delta = 0;
+      if (!readVLQ(data, trEnd, &trPos, &delta)) return false;
+      tick += delta;
+      if (trPos >= trEnd) break;
+
+      uint8_t status = data[trPos++];
+      if (status < 0x80) {
+        if (runningStatus == 0) return false;
+        trPos--;
+        status = runningStatus;
+      } else if (status < 0xF0) {
+        runningStatus = status;
+      } else {
+        runningStatus = 0;
+      }
+
+      if (status == 0xFF) {
+        if (trPos >= trEnd) return false;
+        uint8_t metaType = data[trPos++];
+        uint32_t metaLen = 0;
+        if (!readVLQ(data, trEnd, &trPos, &metaLen)) return false;
+        if (trPos + metaLen > trEnd) return false;
+
+        if (metaType == 0x51 && metaLen == 3) {
+          uint32_t usPerQuarter =
+            ((uint32_t)data[trPos] << 16) |
+            ((uint32_t)data[trPos + 1] << 8) |
+            (uint32_t)data[trPos + 2];
+          if (usPerQuarter > 0) {
+            if (!appendTempoEvent(tick, usPerQuarter)) return false;
+          }
+        }
+        trPos += metaLen;
+        continue;
+      }
+
+      if (status == 0xF0 || status == 0xF7) {
+        uint32_t syxLen = 0;
+        if (!readVLQ(data, trEnd, &trPos, &syxLen)) return false;
+        if (trPos + syxLen > trEnd) return false;
+        trPos += syxLen;
+        continue;
+      }
+
+      uint8_t kind = status & 0xF0;
+      if (kind == 0xC0 || kind == 0xD0) {
+        if (trPos + 1 > trEnd) return false;
+        trPos += 1;
+      } else {
+        if (trPos + 2 > trEnd) return false;
+        uint8_t d1 = data[trPos++];
+        uint8_t d2 = data[trPos++];
+
+        if (kind == 0x80) {
+          if (!appendMidiEvent(tick, MIDI_NOTE_OFF, d1, d2)) return false;
+        } else if (kind == 0x90) {
+          if (d2 == 0) {
+            if (!appendMidiEvent(tick, MIDI_NOTE_OFF, d1, d2)) return false;
+          } else {
+            if (!appendMidiEvent(tick, MIDI_NOTE_ON, d1, d2)) return false;
+          }
+        }
+      }
+    }
+
+    pos = trEnd;
+  }
+
+  if (midiEventCount == 0) {
+    Serial.println("No note events in MIDI.");
+    return false;
+  }
+
+  computeEventTimesFromTempo();
+  return true;
+}
+
+//---------------------------------------------------------------
+//  MIDIã‚¤ãƒ™ãƒ³ãƒˆæ¯”è¼ƒ
+//---------------------------------------------------------------
+int cmpMidiEvent(const void* a, const void* b) {
+  const MidiEvent* ea = (const MidiEvent*)a;
+  const MidiEvent* eb = (const MidiEvent*)b;
+  if (ea->tick < eb->tick) return -1;
+  if (ea->tick > eb->tick) return 1;
+  if (ea->type < eb->type) return -1; // OFFã‚’å…ˆã«
+  if (ea->type > eb->type) return 1;
+  if (ea->note < eb->note) return -1;
+  if (ea->note > eb->note) return 1;
+  return 0;
+}
+
+//---------------------------------------------------------------
+//  ãƒ†ãƒ³ãƒã‚¤ãƒ™ãƒ³ãƒˆæ¯”è¼ƒ
+//---------------------------------------------------------------
+int cmpTempoEvent(const void* a, const void* b) {
+  const TempoEvent* ta = (const TempoEvent*)a;
+  const TempoEvent* tb = (const TempoEvent*)b;
+  if (ta->tick < tb->tick) return -1;
+  if (ta->tick > tb->tick) return 1;
+  if (ta->usPerQuarter < tb->usPerQuarter) return -1;
+  if (ta->usPerQuarter > tb->usPerQuarter) return 1;
+  return 0;
+}
+
+//---------------------------------------------------------------
+//  tick -> å†ç”Ÿæ™‚åˆ»(us) å¤‰æ›
+//---------------------------------------------------------------
+void computeEventTimesFromTempo(void) {
+  qsort(midiEvents, midiEventCount, sizeof(MidiEvent), cmpMidiEvent);
+  qsort(tempoEvents, tempoEventCount, sizeof(TempoEvent), cmpTempoEvent);
+
+  size_t tempoPos = 0;
+  uint32_t currentTempo = tempoEvents[0].usPerQuarter;
+  uint32_t segmentTick = tempoEvents[0].tick;
+  uint64_t segmentUs = 0;
+
+  for (size_t i = 0; i < midiEventCount; i++) {
+    uint32_t eventTick = midiEvents[i].tick;
+
+    while ((tempoPos + 1) < tempoEventCount && tempoEvents[tempoPos + 1].tick <= eventTick) {
+      uint32_t nextTick = tempoEvents[tempoPos + 1].tick;
+      if (nextTick > segmentTick) {
+        segmentUs += ((uint64_t)(nextTick - segmentTick) * (uint64_t)currentTempo) / (uint64_t)midiDivision;
+      }
+      segmentTick = nextTick;
+      tempoPos++;
+      currentTempo = tempoEvents[tempoPos].usPerQuarter;
+    }
+
+    uint64_t eventUs = segmentUs;
+    if (eventTick > segmentTick) {
+      eventUs += ((uint64_t)(eventTick - segmentTick) * (uint64_t)currentTempo) / (uint64_t)midiDivision;
+    }
+    midiEvents[i].timeUs = (eventUs > 0xFFFFFFFFULL) ? 0xFFFFFFFFUL : (uint32_t)eventUs;
+  }
+}
+
+//---------------------------------------------------------------
+//  æ›²ãƒ­ãƒ¼ãƒ‰
+//---------------------------------------------------------------
+bool loadMidiSongByIndex(size_t songIndex) {
+  if (songIndex >= midiSongCount) return false;
+
+  if ((int)songIndex == loadedSongIndex && midiEventCount > 0) {
+    return true;
+  }
+
+  uint8_t* buf = nullptr;
+  size_t len = 0;
+  if (!readFileIntoBuffer(midiSongs[songIndex].path, &buf, &len)) {
+    return false;
+  }
+
+  stopMidiPlayback();
+  resetMidiBuffers();
+
+  bool ok = parseMidiBuffer(buf, len);
+  free(buf);
+
+  if (!ok) {
+    resetMidiBuffers();
+    loadedSongIndex = -1;
+    return false;
+  }
+
+  loadedSongIndex = (int)songIndex;
+  Serial.print("Loaded MIDI: events=");
+  Serial.print((int)midiEventCount);
+  Serial.print(" tempo=");
+  Serial.println((int)tempoEventCount);
+  return true;
+}
+
+//---------------------------------------------------------------
+//  å†ç”Ÿé–‹å§‹
+//---------------------------------------------------------------
+void startMidiPlayback(void) {
+  memset(midiActiveNotes, 0, sizeof(midiActiveNotes));
+  currentMidiNote = -1;
+  midiPlayPos = 0;
+  midiPlaybackFreq = 0;
+  midiPlayStartUs = micros();
+  midiIsPlaying = (midiEventCount > 0);
+}
+
+//---------------------------------------------------------------
+//  å†ç”Ÿåœæ­¢
+//---------------------------------------------------------------
+void stopMidiPlayback(void) {
+  midiIsPlaying = false;
+  midiPlayPos = 0;
+  midiPlaybackFreq = 0;
+  currentMidiNote = -1;
+  memset(midiActiveNotes, 0, sizeof(midiActiveNotes));
+}
+
+//---------------------------------------------------------------
+//  å†ç”Ÿé€²è¡Œ
+//---------------------------------------------------------------
+void updateMidiPlayback(void) {
+  if (!midiIsPlaying || midiEventCount == 0) {
+    midiPlaybackFreq = 0;
+    return;
+  }
+
+  uint32_t elapsedUs = (uint32_t)(micros() - midiPlayStartUs);
+  while (midiPlayPos < midiEventCount && midiEvents[midiPlayPos].timeUs <= elapsedUs) {
+    handleMidiEvent(&midiEvents[midiPlayPos]);
+    midiPlayPos++;
+  }
+
+  if (currentMidiNote >= 0 && currentMidiNote < 128) {
+    midiPlaybackFreq = midiFreqTable[currentMidiNote];
+  } else {
+    midiPlaybackFreq = 0;
+  }
+
+  if (midiPlayPos >= midiEventCount && currentMidiNote < 0) {
+    midiIsPlaying = false;
+  }
+}
+
+//---------------------------------------------------------------
+//  MIDIã‚¤ãƒ™ãƒ³ãƒˆåæ˜ 
+//---------------------------------------------------------------
+void handleMidiEvent(const MidiEvent* ev) {
+  if (ev == nullptr) return;
+  if (ev->note >= 128) return;
+
+  if (ev->type == MIDI_NOTE_ON) {
+    if (midiActiveNotes[ev->note] < 255) {
+      midiActiveNotes[ev->note]++;
+    }
+    currentMidiNote = ev->note;
+  } else {
+    if (midiActiveNotes[ev->note] > 0) {
+      midiActiveNotes[ev->note]--;
+    }
+    if (currentMidiNote == ev->note && midiActiveNotes[ev->note] == 0) {
+      currentMidiNote = findHighestActiveMidiNote();
+    }
+  }
+}
+
+//---------------------------------------------------------------
+//  ç™ºéŸ³ä¸­ãƒãƒ¼ãƒˆæ¢ç´¢
+//---------------------------------------------------------------
+int findHighestActiveMidiNote(void) {
+  for (int n = 127; n >= 0; n--) {
+    if (midiActiveNotes[n] > 0) return n;
+  }
+  return -1;
 }
