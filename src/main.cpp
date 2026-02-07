@@ -1055,6 +1055,7 @@ bool parseMidiBuffer(const uint8_t* data, size_t len) {
     size_t trEnd = pos + trLen;
     uint32_t tick = 0;
     uint8_t runningStatus = 0;
+    uint8_t trackActiveNotes[MIDI_CHANNEL_COUNT][128] = {{0}};
 
     while (trPos < trEnd) {
       uint32_t delta = 0;
@@ -1117,14 +1118,35 @@ bool parseMidiBuffer(const uint8_t* data, size_t len) {
 
         if (kind == 0x80) {
           if (!appendMidiEvent(tick, MIDI_NOTE_OFF, channel, d1, d2)) return false;
+          if (trackActiveNotes[channel][d1] > 0) {
+            trackActiveNotes[channel][d1]--;
+          }
         } else if (kind == 0x90) {
           if (d2 == 0) {
             if (!appendMidiEvent(tick, MIDI_NOTE_OFF, channel, d1, d2)) return false;
+            if (trackActiveNotes[channel][d1] > 0) {
+              trackActiveNotes[channel][d1]--;
+            }
           } else {
             if (!appendMidiEvent(tick, MIDI_NOTE_ON, channel, d1, d2)) return false;
             chNoteOnCount[channel]++;
             chNoteSum[channel] += d1;
+            if (trackActiveNotes[channel][d1] < 255) {
+              trackActiveNotes[channel][d1]++;
+            }
           }
+        }
+      }
+    }
+
+    // Some files end a track without explicit note-off events.
+    // Force-release notes at that track's end tick to avoid stuck tones.
+    for (uint8_t ch = 0; ch < MIDI_CHANNEL_COUNT; ch++) {
+      if (ch == MIDI_DRUM_CHANNEL) continue;
+      for (uint16_t note = 0; note < 128; note++) {
+        while (trackActiveNotes[ch][note] > 0) {
+          if (!appendMidiEvent(tick, MIDI_NOTE_OFF, ch, (uint8_t)note, 0)) return false;
+          trackActiveNotes[ch][note]--;
         }
       }
     }
