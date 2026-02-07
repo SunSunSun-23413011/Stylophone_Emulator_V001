@@ -1,0 +1,4 @@
+996:  audioOutput->SetPinout(AUDIO_I2S_BCLK_PIN, AUDIO_I2S_WCLK_PIN, BUZZER_PIN);
+997:  audioOutput->SetOutputModeMono(true);
+998:  audioOutput->SetGain(0.18f);
+1021:    audioOutput->stop();

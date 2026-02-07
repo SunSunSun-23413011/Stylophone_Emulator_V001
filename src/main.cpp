@@ -14,6 +14,11 @@
 #include <Arduino.h>
 #include <FS.h>
 #include <SPIFFS.h>
+#include <AudioFileSourceSPIFFS.h>
+#include <AudioGenerator.h>
+#include <AudioGeneratorMP3.h>
+#include <AudioGeneratorWAV.h>
+#include <AudioOutputI2SNoDAC.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +34,8 @@
 #define BUZZER_PIN 7
 #define VIB_PIN    10
 #define MODE_PIN   11
+#define AUDIO_I2S_BCLK_PIN 18
+#define AUDIO_I2S_WCLK_PIN 19
 #define SW_UP      16
 #define SW_DOWN    17
 #define DOS5_PIN   21
@@ -83,9 +90,22 @@ enum MidiEventType : uint8_t {
   MIDI_NOTE_ON  = 1
 };
 
+enum SongType : uint8_t {
+  SONG_TYPE_MIDI = 0,
+  SONG_TYPE_AUDIO = 1
+};
+
+enum AudioCodecType : uint8_t {
+  AUDIO_CODEC_NONE = 0,
+  AUDIO_CODEC_MP3 = 1,
+  AUDIO_CODEC_WAV = 2
+};
+
 struct MidiSongInfo {
   char path[96];
   char name[64];
+  uint8_t type;
+  uint8_t codec;
 };
 
 struct MidiEvent {
@@ -171,6 +191,13 @@ static int currentMidiNote = -1;
 static volatile int midiPlaybackFreq = 0;
 static int midiFreqTable[128] = {0};
 
+// Audio再生状態
+static AudioOutputI2SNoDAC* audioOutput = nullptr;
+static AudioFileSourceSPIFFS* audioFileSource = nullptr;
+static AudioGenerator* audioGenerator = nullptr;
+static bool audioIsPlaying = false;
+static int loadedAudioSongIndex = -1;
+
 // SW_UP / SW_DOWN debouncing
 static uint8_t speedLastRaw = 0x03;
 static uint8_t speedStableRaw = 0x03;
@@ -205,8 +232,12 @@ void setActiveSongSpeedByIndex(int songIndex);
 void changeSelectedSongSpeed(int deltaSteps);
 void updateSongSpeedButtons(uint32_t nowMs);
 bool pathHasMidExt(const char* path);
+bool pathHasAudioExt(const char* path, uint8_t* outCodec);
 const char* basenameFromPath(const char* path);
 void normalizeSpiffsPath(char* dst, size_t dstSize, const char* folder, const char* rawName);
+bool startAudioSongByIndex(size_t songIndex);
+void stopAudioPlayback(void);
+void updateAudioPlayback(void);
 
 void resetMidiBuffers(void);
 bool reserveMidiEvents(size_t needCount);
@@ -284,6 +315,9 @@ void loop() {
     processSongModeLogic();
   } else {
     midiPlaybackFreq = 0;
+    if (audioIsPlaying) {
+      stopAudioPlayback();
+    }
   }
 
   updateBuzzerNonBlocking();
@@ -303,6 +337,7 @@ void handleModeChange(bool nextSongMode) {
   } else {
     Serial.println("[MODE] PLAY");
     stopMidiPlayback();
+    stopAudioPlayback();
     selectedSongIndex = -1;
     setActiveSongSpeedByIndex(-1);
   }
@@ -360,27 +395,43 @@ void processSongModeLogic(void) {
     if (!spiffsReady) {
       Serial.println("SPIFFS not ready.");
     } else if (midiSongCount == 0) {
-      Serial.println("No MIDI files in /m or /midi");
+      Serial.println("No supported songs in /m /midi /a /audio");
     } else {
       size_t songIndex = (size_t)key % midiSongCount;
-      if (loadMidiSongByIndex(songIndex)) {
-        selectedSongIndex = (int)songIndex;
-        setActiveSongSpeedByIndex(selectedSongIndex);
-        startMidiPlayback();
-        Serial.print("[PLAY] ");
-        Serial.print(midiSongs[songIndex].name);
-        Serial.print("  (key=");
-        Serial.print(key);
-        Serial.print(", idx=");
-        Serial.print(songIndex);
-        Serial.print(", speed=");
-        Serial.print((int)activeMidiSpeedPermille);
-        Serial.println(")");
+      if (midiSongs[songIndex].type == SONG_TYPE_MIDI) {
+        stopAudioPlayback();
+        if (loadMidiSongByIndex(songIndex)) {
+          selectedSongIndex = (int)songIndex;
+          setActiveSongSpeedByIndex(selectedSongIndex);
+          startMidiPlayback();
+          Serial.print("[PLAY] MIDI ");
+          Serial.print(midiSongs[songIndex].name);
+          Serial.print("  (key=");
+          Serial.print(key);
+          Serial.print(", idx=");
+          Serial.print(songIndex);
+          Serial.print(", speed=");
+          Serial.print((int)activeMidiSpeedPermille);
+          Serial.println(")");
+        }
+      } else {
+        if (startAudioSongByIndex(songIndex)) {
+          selectedSongIndex = (int)songIndex;
+          setActiveSongSpeedByIndex(selectedSongIndex);
+          Serial.print("[PLAY] AUDIO ");
+          Serial.print(midiSongs[songIndex].name);
+          Serial.print("  (key=");
+          Serial.print(key);
+          Serial.print(", idx=");
+          Serial.print(songIndex);
+          Serial.println(")");
+        }
       }
     }
   }
 
   updateMidiPlayback();
+  updateAudioPlayback();
 }
 
 //---------------------------------------------------------------
@@ -449,6 +500,15 @@ void updateBuzzerNonBlocking(void) {
       }
     }
     prevStableRaw = stableRaw;
+  }
+
+  if (songMode && audioIsPlaying) {
+    if (currentFreq != 0) {
+      currentFreq = 0;
+      ledcWriteTone(BUZZER_PIN, 0);
+      ledcWrite(BUZZER_PIN, 0);
+    }
+    return;
   }
 
   int targetFreq = 0;
@@ -566,58 +626,97 @@ bool initSpiffsAndSongList(void) {
 }
 
 //---------------------------------------------------------------
-//  /midi 配下の .mid 列挙
+//  曲ファイル列挙
 //---------------------------------------------------------------
 void scanMidiSongs(void) {
   midiSongCount = 0;
-  const char* folder = "/m";
-  File dir = SPIFFS.open(folder);
-  if (!dir || !dir.isDirectory()) {
-    folder = "/midi";
-    dir = SPIFFS.open(folder);
-  }
-  if (!dir || !dir.isDirectory()) {
-    Serial.println("Directory '/m' or '/midi' not found.");
-    return;
-  }
+  const char* folders[] = {"/m", "/midi", "/a", "/audio"};
+  bool foundAnyFolder = false;
 
-  File file = dir.openNextFile();
-  while (file && midiSongCount < MAX_SONGS) {
-    if (!file.isDirectory()) {
-      const char* path = file.name();
-      if (path != nullptr && pathHasMidExt(path)) {
-        normalizeSpiffsPath(
-          midiSongs[midiSongCount].path,
-          sizeof(midiSongs[midiSongCount].path),
-          folder,
-          path
-        );
-
-        const char* base = basenameFromPath(path);
-        strncpy(midiSongs[midiSongCount].name, base, sizeof(midiSongs[midiSongCount].name) - 1);
-        midiSongs[midiSongCount].name[sizeof(midiSongs[midiSongCount].name) - 1] = '\0';
-        midiSongCount++;
-      }
+  for (size_t fi = 0; fi < (sizeof(folders) / sizeof(folders[0])); fi++) {
+    const char* folder = folders[fi];
+    File dir = SPIFFS.open(folder);
+    if (!dir || !dir.isDirectory()) {
+      if (dir) dir.close();
+      continue;
     }
-    file.close();
-    file = dir.openNextFile();
+    foundAnyFolder = true;
+
+    File file = dir.openNextFile();
+    while (file && midiSongCount < MAX_SONGS) {
+      if (!file.isDirectory()) {
+        const char* path = file.name();
+        if (path != nullptr) {
+          uint8_t songType = 0xFF;
+          uint8_t codec = AUDIO_CODEC_NONE;
+          if (pathHasMidExt(path)) {
+            songType = SONG_TYPE_MIDI;
+          } else if (pathHasAudioExt(path, &codec)) {
+            songType = SONG_TYPE_AUDIO;
+          }
+
+          if (songType != 0xFF) {
+            char fullPath[96];
+            normalizeSpiffsPath(fullPath, sizeof(fullPath), folder, path);
+
+            bool exists = false;
+            for (size_t i = 0; i < midiSongCount; i++) {
+              if (strcmp(midiSongs[i].path, fullPath) == 0) {
+                exists = true;
+                break;
+              }
+            }
+
+            if (!exists) {
+              strncpy(midiSongs[midiSongCount].path, fullPath, sizeof(midiSongs[midiSongCount].path) - 1);
+              midiSongs[midiSongCount].path[sizeof(midiSongs[midiSongCount].path) - 1] = '\0';
+
+              const char* base = basenameFromPath(path);
+              strncpy(midiSongs[midiSongCount].name, base, sizeof(midiSongs[midiSongCount].name) - 1);
+              midiSongs[midiSongCount].name[sizeof(midiSongs[midiSongCount].name) - 1] = '\0';
+              midiSongs[midiSongCount].type = songType;
+              midiSongs[midiSongCount].codec = codec;
+              midiSongCount++;
+            }
+          }
+        }
+      }
+      file.close();
+      file = dir.openNextFile();
+    }
+    dir.close();
   }
-  dir.close();
+
+  if (!foundAnyFolder) {
+    Serial.println("Directory '/m' '/midi' '/a' '/audio' not found.");
+  }
 }
 
 //---------------------------------------------------------------
 //  曲一覧表示
 //---------------------------------------------------------------
 void printSongList(void) {
-  Serial.print("MIDI files: ");
+  Serial.print("Songs: ");
   Serial.println((int)midiSongCount);
   for (size_t i = 0; i < midiSongCount; i++) {
     Serial.print("  [");
     Serial.print((int)i);
     Serial.print("] ");
     Serial.print(midiSongs[i].name);
-    Serial.print("  speed=");
-    Serial.println((int)midiSongSpeedPermille[i]);
+    if (midiSongs[i].type == SONG_TYPE_MIDI) {
+      Serial.print("  [MIDI] speed=");
+      Serial.println((int)midiSongSpeedPermille[i]);
+    } else {
+      Serial.print("  [AUDIO ");
+      if (midiSongs[i].codec == AUDIO_CODEC_MP3) {
+        Serial.print("MP3");
+      } else if (midiSongs[i].codec == AUDIO_CODEC_WAV) {
+        Serial.print("WAV");
+      } else {
+        Serial.print("UNKNOWN");
+      }
+      Serial.println("]");
+    }
   }
 }
 
@@ -713,7 +812,9 @@ void saveSongSpeedTableToSpiffs(void) {
 //  選択曲の速度を現在値へ反映
 //---------------------------------------------------------------
 void setActiveSongSpeedByIndex(int songIndex) {
-  if (songIndex >= 0 && songIndex < (int)midiSongCount) {
+  if (songIndex >= 0 &&
+      songIndex < (int)midiSongCount &&
+      midiSongs[songIndex].type == SONG_TYPE_MIDI) {
     activeMidiSpeedPermille = midiSongSpeedPermille[songIndex];
   } else {
     activeMidiSpeedPermille = clampMidiSpeedPermille((uint32_t)MIDI_PLAYBACK_SPEED_PERMILLE);
@@ -727,6 +828,10 @@ void changeSelectedSongSpeed(int deltaSteps) {
   if (deltaSteps == 0) return;
   if (selectedSongIndex < 0 || selectedSongIndex >= (int)midiSongCount) {
     Serial.println("[SPEED] Select song first.");
+    return;
+  }
+  if (midiSongs[selectedSongIndex].type != SONG_TYPE_MIDI) {
+    Serial.println("[SPEED] MIDI only.");
     return;
   }
 
@@ -793,6 +898,42 @@ bool pathHasMidExt(const char* path) {
 }
 
 //---------------------------------------------------------------
+//  拡張子判定(.mp3/.wav)
+//---------------------------------------------------------------
+bool pathHasAudioExt(const char* path, uint8_t* outCodec) {
+  if (outCodec != nullptr) {
+    *outCodec = AUDIO_CODEC_NONE;
+  }
+  if (path == nullptr) return false;
+
+  size_t n = strlen(path);
+  if (n < 4) return false;
+  const char* ext = path + (n - 4);
+
+  bool isMp3 =
+    (ext[0] == '.') &&
+    ((ext[1] == 'm') || (ext[1] == 'M')) &&
+    ((ext[2] == 'p') || (ext[2] == 'P')) &&
+    (ext[3] == '3');
+  if (isMp3) {
+    if (outCodec != nullptr) *outCodec = AUDIO_CODEC_MP3;
+    return true;
+  }
+
+  bool isWav =
+    (ext[0] == '.') &&
+    ((ext[1] == 'w') || (ext[1] == 'W')) &&
+    ((ext[2] == 'a') || (ext[2] == 'A')) &&
+    ((ext[3] == 'v') || (ext[3] == 'V'));
+  if (isWav) {
+    if (outCodec != nullptr) *outCodec = AUDIO_CODEC_WAV;
+    return true;
+  }
+
+  return false;
+}
+
+//---------------------------------------------------------------
 //  パスからファイル名抽出
 //---------------------------------------------------------------
 const char* basenameFromPath(const char* path) {
@@ -838,6 +979,117 @@ void normalizeSpiffsPath(char* dst, size_t dstSize, const char* folder, const ch
     dst[n++] = rawName[i];
   }
   dst[n] = '\0';
+}
+
+//---------------------------------------------------------------
+//  Audio出力初期化
+//---------------------------------------------------------------
+static bool ensureAudioOutput(void) {
+  if (audioOutput != nullptr) return true;
+
+  audioOutput = new AudioOutputI2SNoDAC(0);
+  if (audioOutput == nullptr) {
+    Serial.println("Audio output alloc failed.");
+    return false;
+  }
+
+  audioOutput->SetPinout(AUDIO_I2S_BCLK_PIN, AUDIO_I2S_WCLK_PIN, BUZZER_PIN);
+  audioOutput->SetOutputModeMono(true);
+  audioOutput->SetGain(0.18f);
+  return true;
+}
+
+//---------------------------------------------------------------
+//  Audio停止
+//---------------------------------------------------------------
+void stopAudioPlayback(void) {
+  audioIsPlaying = false;
+
+  if (audioGenerator != nullptr) {
+    audioGenerator->stop();
+    delete audioGenerator;
+    audioGenerator = nullptr;
+  }
+
+  if (audioFileSource != nullptr) {
+    audioFileSource->close();
+    delete audioFileSource;
+    audioFileSource = nullptr;
+  }
+
+  if (audioOutput != nullptr) {
+    audioOutput->stop();
+  }
+
+  // Audio(I2S)で奪ったBUZZERピンをLEDCへ戻す
+  ledcAttach(BUZZER_PIN, 2000, 8);
+  ledcWriteTone(BUZZER_PIN, 0);
+  ledcWrite(BUZZER_PIN, 0);
+  currentFreq = -1;
+
+  loadedAudioSongIndex = -1;
+}
+
+//---------------------------------------------------------------
+//  Audio再生開始
+//---------------------------------------------------------------
+bool startAudioSongByIndex(size_t songIndex) {
+  if (songIndex >= midiSongCount) return false;
+  if (midiSongs[songIndex].type != SONG_TYPE_AUDIO) return false;
+
+  stopMidiPlayback();
+  stopAudioPlayback();
+
+  if (!ensureAudioOutput()) return false;
+
+  audioFileSource = new AudioFileSourceSPIFFS(midiSongs[songIndex].path);
+  if (audioFileSource == nullptr || !audioFileSource->isOpen()) {
+    Serial.print("Failed to open audio: ");
+    Serial.println(midiSongs[songIndex].path);
+    if (audioFileSource != nullptr) {
+      delete audioFileSource;
+      audioFileSource = nullptr;
+    }
+    return false;
+  }
+
+  if (midiSongs[songIndex].codec == AUDIO_CODEC_MP3) {
+    audioGenerator = new AudioGeneratorMP3();
+  } else if (midiSongs[songIndex].codec == AUDIO_CODEC_WAV) {
+    audioGenerator = new AudioGeneratorWAV();
+  } else {
+    Serial.println("Unsupported audio codec.");
+    stopAudioPlayback();
+    return false;
+  }
+
+  if (audioGenerator == nullptr) {
+    Serial.println("Audio decoder alloc failed.");
+    stopAudioPlayback();
+    return false;
+  }
+
+  if (!audioGenerator->begin(audioFileSource, audioOutput)) {
+    Serial.println("Failed to start audio decoder.");
+    stopAudioPlayback();
+    return false;
+  }
+
+  audioIsPlaying = true;
+  loadedAudioSongIndex = (int)songIndex;
+  midiPlaybackFreq = 0;
+  return true;
+}
+
+//---------------------------------------------------------------
+//  Audio再生進行
+//---------------------------------------------------------------
+void updateAudioPlayback(void) {
+  if (!audioIsPlaying || audioGenerator == nullptr) return;
+
+  if (!audioGenerator->loop()) {
+    stopAudioPlayback();
+  }
 }
 
 //---------------------------------------------------------------
