@@ -28,7 +28,9 @@
 #define SW_ADC_PIN 0   // GPIO0 = ADC1_CH0
 #define BUZZER_PIN 7
 #define VIB_PIN    10
-#define MODE_PIN   11  // 配線に合わせて変更
+#define MODE_PIN   11
+#define SW_UP      16
+#define SW_DOWN    17
 #define DOS5_PIN   21
 #define RE5_PIN    22
 #define MI5_PIN    23
@@ -68,6 +70,10 @@ static const uint32_t DEFAULT_TEMPO_US_PER_QN = 500000UL;
 static const size_t MAX_SONGS = 32;
 static const uint8_t MIDI_DRUM_CHANNEL = 9;
 static const uint8_t MIDI_CHANNEL_COUNT = 16;
+static const uint16_t MIDI_SPEED_MIN_PERMILLE = 250;   // 0.25x
+static const uint16_t MIDI_SPEED_MAX_PERMILLE = 4000;  // 4.00x
+static const uint16_t MIDI_SPEED_STEP_PERMILLE = 100;  // 0.10x step
+static const char* const MIDI_SPEED_STORE_PATH = "/midi_speed.cfg";
 
 //---------------------------------------------------------------
 //  MIDI用構造体
@@ -136,6 +142,8 @@ static MidiSongInfo midiSongs[MAX_SONGS];
 static size_t midiSongCount = 0;
 static bool spiffsReady = false;
 static int selectedSongIndex = -1;
+static uint16_t midiSongSpeedPermille[MAX_SONGS] = {0};
+static uint16_t activeMidiSpeedPermille = 1000;
 
 // MIDIデータ(現在読み込んだ1曲分)
 static MidiEvent* midiEvents = nullptr;
@@ -155,12 +163,19 @@ static size_t midiChannelPriorityCount = 0;
 // MIDI再生状態
 static bool midiIsPlaying = false;
 static size_t midiPlayPos = 0;
-static uint32_t midiPlayStartUs = 0;
+static uint32_t midiPlayLastRealUs = 0;
+static uint64_t midiPlayElapsedSongUs = 0;
 static uint8_t midiActiveNotes[MIDI_CHANNEL_COUNT][128] = {{0}};
 static int midiCurrentNoteByChannel[MIDI_CHANNEL_COUNT] = {0};
 static int currentMidiNote = -1;
 static volatile int midiPlaybackFreq = 0;
 static int midiFreqTable[128] = {0};
+
+// SW_UP / SW_DOWN debouncing
+static uint8_t speedLastRaw = 0x03;
+static uint8_t speedStableRaw = 0x03;
+static uint8_t speedPrevStableRaw = 0x03;
+static uint32_t speedLastChangeMs = 0;
 
 //---------------------------------------------------------------
 //  関数プロトタイプ宣言
@@ -182,6 +197,13 @@ void buildMidiFreqTable(void);
 bool initSpiffsAndSongList(void);
 void scanMidiSongs(void);
 void printSongList(void);
+uint16_t clampMidiSpeedPermille(uint32_t value);
+void initSongSpeedTable(void);
+void loadSongSpeedTableFromSpiffs(void);
+void saveSongSpeedTableToSpiffs(void);
+void setActiveSongSpeedByIndex(int songIndex);
+void changeSelectedSongSpeed(int deltaSteps);
+void updateSongSpeedButtons(uint32_t nowMs);
 bool pathHasMidExt(const char* path);
 const char* basenameFromPath(const char* path);
 void normalizeSpiffsPath(char* dst, size_t dstSize, const char* folder, const char* rawName);
@@ -219,6 +241,8 @@ void setup() {
   pinMode(DOS5_PIN, INPUT_PULLUP);
   pinMode(RE5_PIN,  INPUT_PULLUP);
   pinMode(MI5_PIN,  INPUT_PULLUP);
+  pinMode(SW_UP,    INPUT_PULLUP);
+  pinMode(SW_DOWN,  INPUT_PULLUP);
   pinMode(VIB_PIN,  INPUT_PULLUP);
   pinMode(MODE_PIN, INPUT_PULLUP);
 
@@ -232,14 +256,15 @@ void setup() {
   timerAttachInterrupt(timer0, &onTimer); // ISR attach
   timerAlarm(timer0, 20000, true, 0);     // 20000us=20ms, autoreload
 
+  activeMidiSpeedPermille = clampMidiSpeedPermille((uint32_t)MIDI_PLAYBACK_SPEED_PERMILLE);
   buildMidiFreqTable();
   spiffsReady = initSpiffsAndSongList();
 
   songMode = (digitalRead(MODE_PIN) == LOW);
   Serial.print("Boot Mode: ");
   Serial.println(songMode ? "SONG" : "PLAY");
-  Serial.print("MIDI Speed(per mille): ");
-  Serial.println((int)MIDI_PLAYBACK_SPEED_PERMILLE);
+  Serial.print("MIDI Speed Default(per mille): ");
+  Serial.println((int)activeMidiSpeedPermille);
 }
 
 //---------------------------------------------------------------
@@ -274,10 +299,12 @@ void handleModeChange(bool nextSongMode) {
   if (songMode) {
     Serial.println("[MODE] SONG");
     adcFreq = 0;
+    setActiveSongSpeedByIndex(selectedSongIndex);
   } else {
     Serial.println("[MODE] PLAY");
     stopMidiPlayback();
     selectedSongIndex = -1;
+    setActiveSongSpeedByIndex(-1);
   }
   currentFreq = -1;
 }
@@ -338,6 +365,7 @@ void processSongModeLogic(void) {
       size_t songIndex = (size_t)key % midiSongCount;
       if (loadMidiSongByIndex(songIndex)) {
         selectedSongIndex = (int)songIndex;
+        setActiveSongSpeedByIndex(selectedSongIndex);
         startMidiPlayback();
         Serial.print("[PLAY] ");
         Serial.print(midiSongs[songIndex].name);
@@ -345,6 +373,8 @@ void processSongModeLogic(void) {
         Serial.print(key);
         Serial.print(", idx=");
         Serial.print(songIndex);
+        Serial.print(", speed=");
+        Serial.print((int)activeMidiSpeedPermille);
         Serial.println(")");
       }
     }
@@ -405,6 +435,8 @@ void updateBuzzerNonBlocking(void) {
   if (now - lastChangeMs >= DEBOUNCE_MS) {
     stableRaw = raw;
   }
+
+  updateSongSpeedButtons(now);
 
   // デジタルボタンの押下エッジを曲選択用に登録
   if (stableRaw != prevStableRaw) {
@@ -527,6 +559,8 @@ bool initSpiffsAndSongList(void) {
     return false;
   }
   scanMidiSongs();
+  initSongSpeedTable();
+  loadSongSpeedTableFromSpiffs();
   printSongList();
   return true;
 }
@@ -581,7 +615,167 @@ void printSongList(void) {
     Serial.print("  [");
     Serial.print((int)i);
     Serial.print("] ");
-    Serial.println(midiSongs[i].name);
+    Serial.print(midiSongs[i].name);
+    Serial.print("  speed=");
+    Serial.println((int)midiSongSpeedPermille[i]);
+  }
+}
+
+//---------------------------------------------------------------
+//  MIDI再生速度 clamp
+//---------------------------------------------------------------
+uint16_t clampMidiSpeedPermille(uint32_t value) {
+  if (value < (uint32_t)MIDI_SPEED_MIN_PERMILLE) return MIDI_SPEED_MIN_PERMILLE;
+  if (value > (uint32_t)MIDI_SPEED_MAX_PERMILLE) return MIDI_SPEED_MAX_PERMILLE;
+  return (uint16_t)value;
+}
+
+//---------------------------------------------------------------
+//  曲別速度テーブル初期化
+//---------------------------------------------------------------
+void initSongSpeedTable(void) {
+  uint16_t defaultSpeed = clampMidiSpeedPermille((uint32_t)MIDI_PLAYBACK_SPEED_PERMILLE);
+  for (size_t i = 0; i < MAX_SONGS; i++) {
+    midiSongSpeedPermille[i] = defaultSpeed;
+  }
+  activeMidiSpeedPermille = defaultSpeed;
+}
+
+//---------------------------------------------------------------
+//  曲別速度テーブル読み込み
+//---------------------------------------------------------------
+void loadSongSpeedTableFromSpiffs(void) {
+  if (midiSongCount == 0) return;
+
+  File file = SPIFFS.open(MIDI_SPEED_STORE_PATH, "r");
+  if (!file) {
+    Serial.println("MIDI speed table not found. Use defaults.");
+    return;
+  }
+
+  char line[192];
+  while (file.available()) {
+    size_t n = file.readBytesUntil('\n', line, sizeof(line) - 1);
+    line[n] = '\0';
+
+    while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == ' ' || line[n - 1] == '\t')) {
+      n--;
+      line[n] = '\0';
+    }
+    if (n == 0 || line[0] == '#') continue;
+
+    char* sep = strchr(line, '|');
+    if (sep == nullptr) continue;
+    *sep = '\0';
+
+    char* path = line;
+    char* speedText = sep + 1;
+    while (*speedText == ' ' || *speedText == '\t') speedText++;
+
+    char* endPtr = nullptr;
+    unsigned long raw = strtoul(speedText, &endPtr, 10);
+    if (endPtr == speedText) continue;
+    uint16_t speed = clampMidiSpeedPermille((uint32_t)raw);
+
+    for (size_t i = 0; i < midiSongCount; i++) {
+      if (strcmp(midiSongs[i].path, path) == 0) {
+        midiSongSpeedPermille[i] = speed;
+        break;
+      }
+    }
+  }
+
+  file.close();
+}
+
+//---------------------------------------------------------------
+//  曲別速度テーブル保存
+//---------------------------------------------------------------
+void saveSongSpeedTableToSpiffs(void) {
+  if (!spiffsReady) return;
+
+  File file = SPIFFS.open(MIDI_SPEED_STORE_PATH, "w");
+  if (!file) {
+    Serial.println("Failed to save MIDI speed table.");
+    return;
+  }
+
+  for (size_t i = 0; i < midiSongCount; i++) {
+    file.print(midiSongs[i].path);
+    file.print('|');
+    file.println((int)midiSongSpeedPermille[i]);
+  }
+
+  file.close();
+}
+
+//---------------------------------------------------------------
+//  選択曲の速度を現在値へ反映
+//---------------------------------------------------------------
+void setActiveSongSpeedByIndex(int songIndex) {
+  if (songIndex >= 0 && songIndex < (int)midiSongCount) {
+    activeMidiSpeedPermille = midiSongSpeedPermille[songIndex];
+  } else {
+    activeMidiSpeedPermille = clampMidiSpeedPermille((uint32_t)MIDI_PLAYBACK_SPEED_PERMILLE);
+  }
+}
+
+//---------------------------------------------------------------
+//  選択曲の速度変更
+//---------------------------------------------------------------
+void changeSelectedSongSpeed(int deltaSteps) {
+  if (deltaSteps == 0) return;
+  if (selectedSongIndex < 0 || selectedSongIndex >= (int)midiSongCount) {
+    Serial.println("[SPEED] Select song first.");
+    return;
+  }
+
+  int32_t next = (int32_t)midiSongSpeedPermille[selectedSongIndex] +
+                 (int32_t)deltaSteps * (int32_t)MIDI_SPEED_STEP_PERMILLE;
+  if (next < 0) next = 0;
+  uint16_t clamped = clampMidiSpeedPermille((uint32_t)next);
+  if (clamped == midiSongSpeedPermille[selectedSongIndex]) return;
+
+  midiSongSpeedPermille[selectedSongIndex] = clamped;
+  activeMidiSpeedPermille = clamped;
+  saveSongSpeedTableToSpiffs();
+
+  Serial.print("[SPEED] ");
+  Serial.print(midiSongs[selectedSongIndex].name);
+  Serial.print(" = ");
+  Serial.print((int)clamped);
+  Serial.println(" permille");
+}
+
+//---------------------------------------------------------------
+//  SW_UP / SW_DOWN 監視
+//---------------------------------------------------------------
+void updateSongSpeedButtons(uint32_t nowMs) {
+  uint8_t raw =
+    ((digitalRead(SW_UP)   ? 1 : 0) << 0) |
+    ((digitalRead(SW_DOWN) ? 1 : 0) << 1);
+
+  if (raw != speedLastRaw) {
+    speedLastRaw = raw;
+    speedLastChangeMs = nowMs;
+  }
+  if (nowMs - speedLastChangeMs >= DEBOUNCE_MS) {
+    speedStableRaw = raw;
+  }
+
+  if (speedStableRaw != speedPrevStableRaw) {
+    bool upWasReleased = ((speedPrevStableRaw & (1 << 0)) != 0);
+    bool upIsPressed = ((speedStableRaw & (1 << 0)) == 0);
+    bool downWasReleased = ((speedPrevStableRaw & (1 << 1)) != 0);
+    bool downIsPressed = ((speedStableRaw & (1 << 1)) == 0);
+
+    if (songMode && upWasReleased && upIsPressed) {
+      changeSelectedSongSpeed(+1);
+    } else if (songMode && downWasReleased && downIsPressed) {
+      changeSelectedSongSpeed(-1);
+    }
+
+    speedPrevStableRaw = speedStableRaw;
   }
 }
 
@@ -1035,11 +1229,6 @@ void computeEventTimesFromTempo(void) {
       eventUs += ((uint64_t)(eventTick - segmentTick) * (uint64_t)currentTempo) / (uint64_t)midiDivision;
     }
 
-    const uint32_t speedPermille = (uint32_t)MIDI_PLAYBACK_SPEED_PERMILLE;
-    if (speedPermille > 0 && speedPermille != 1000U) {
-      eventUs = (eventUs * 1000ULL + (uint64_t)(speedPermille / 2U)) / (uint64_t)speedPermille;
-    }
-
     midiEvents[i].timeUs = (eventUs > 0xFFFFFFFFULL) ? 0xFFFFFFFFUL : (uint32_t)eventUs;
   }
 }
@@ -1102,7 +1291,8 @@ void startMidiPlayback(void) {
   resetMidiChannelState();
   midiPlayPos = 0;
   midiPlaybackFreq = 0;
-  midiPlayStartUs = micros();
+  midiPlayElapsedSongUs = 0;
+  midiPlayLastRealUs = micros();
   midiIsPlaying = (midiEventCount > 0);
 }
 
@@ -1113,6 +1303,8 @@ void stopMidiPlayback(void) {
   midiIsPlaying = false;
   midiPlayPos = 0;
   midiPlaybackFreq = 0;
+  midiPlayElapsedSongUs = 0;
+  midiPlayLastRealUs = 0;
   resetMidiChannelState();
 }
 
@@ -1125,7 +1317,17 @@ void updateMidiPlayback(void) {
     return;
   }
 
-  uint32_t elapsedUs = (uint32_t)(micros() - midiPlayStartUs);
+  uint32_t nowUs = micros();
+  uint32_t realDeltaUs = (uint32_t)(nowUs - midiPlayLastRealUs);
+  midiPlayLastRealUs = nowUs;
+
+  uint64_t scaledDeltaUs =
+    ((uint64_t)realDeltaUs * (uint64_t)activeMidiSpeedPermille + 500ULL) / 1000ULL;
+  midiPlayElapsedSongUs += scaledDeltaUs;
+
+  uint32_t elapsedUs = (midiPlayElapsedSongUs > 0xFFFFFFFFULL)
+                         ? 0xFFFFFFFFUL
+                         : (uint32_t)midiPlayElapsedSongUs;
   while (midiPlayPos < midiEventCount && midiEvents[midiPlayPos].timeUs <= elapsedUs) {
     handleMidiEvent(&midiEvents[midiPlayPos]);
     midiPlayPos++;
