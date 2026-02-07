@@ -18,6 +18,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef MIDI_PLAYBACK_SPEED_PERMILLE
+#define MIDI_PLAYBACK_SPEED_PERMILLE 1000
+#endif
+
 //-------------------------------------------------------------------------
 //  ポート定義
 //-------------------------------------------------------------------------
@@ -226,6 +230,8 @@ void setup() {
   songMode = (digitalRead(MODE_PIN) == LOW);
   Serial.print("Boot Mode: ");
   Serial.println(songMode ? "SONG" : "PLAY");
+  Serial.print("MIDI Speed(per mille): ");
+  Serial.println((int)MIDI_PLAYBACK_SPEED_PERMILLE);
 }
 
 //---------------------------------------------------------------
@@ -976,6 +982,12 @@ void computeEventTimesFromTempo(void) {
     if (eventTick > segmentTick) {
       eventUs += ((uint64_t)(eventTick - segmentTick) * (uint64_t)currentTempo) / (uint64_t)midiDivision;
     }
+
+    const uint32_t speedPermille = (uint32_t)MIDI_PLAYBACK_SPEED_PERMILLE;
+    if (speedPermille > 0 && speedPermille != 1000U) {
+      eventUs = (eventUs * 1000ULL + (uint64_t)(speedPermille / 2U)) / (uint64_t)speedPermille;
+    }
+
     midiEvents[i].timeUs = (eventUs > 0xFFFFFFFFULL) ? 0xFFFFFFFFUL : (uint32_t)eventUs;
   }
 }
