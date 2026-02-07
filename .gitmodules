@@ -1,0 +1,3 @@
+[submodule "data/midi"]
+	path = data/midi
+	url = git@github.com:SunSunSun-23413011/Stylophone-Emulator-V001-MIDI.git
