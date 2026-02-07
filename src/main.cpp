@@ -7,6 +7,7 @@
 //  2026/02/05  Sample. 03 ：ADC,シリアル追加
 //  2026/02/06  Sample. 04 ：ADCスイッチ追加
 //  2026/02/06  Sample. 05 ：ADCスイッチ鍵盤化
+//  2026/02/07  Sample. 06 ：ビブラート追加
 //
 //***************************************************************
 #include <Arduino.h>
@@ -16,6 +17,7 @@
 //-------------------------------------------------------------------------
 #define SW_ADC_PIN 0   // GPIO0 = ADC1_CH0
 #define BUZZER_PIN 7
+#define VIB_PIN    10
 #define DOS5_PIN   21
 #define RE5_PIN    22
 #define MI5_PIN    23
@@ -57,6 +59,7 @@ static const uint8_t adcNoteIdx[7][3] = {
 //---------------------------------------------------------------
 const uint32_t DEBOUNCE_MS = 10;
 int currentFreq = -1;
+static bool lastVibEnabled = false;
 // デジタル3ボタン用デバウンス
 uint8_t lastRaw = 0xFF;
 uint8_t stableRaw = 0xFF;
@@ -72,6 +75,8 @@ static uint8_t swCnt[7]    = {0, 0, 0, 0, 0, 0, 0};   // 連続一致回数
 volatile int adcFreq = 0;
 volatile int adcActiveCh = -1; // 押下中のch(最後に確定した押下)
 volatile int adcActiveSw = -1; // 押下中のsw(0..2)
+static const uint32_t VIBRATO_PERIOD_MS = 167;    // about 6Hz
+static const int VIBRATO_DEPTH_PERMILLE = 25;     // +/-2.5%
 //---------------------------------------------------------------
 //  関数プロトタイプ宣言
 //---------------------------------------------------------------
@@ -80,6 +85,7 @@ void ARDUINO_ISR_ATTR onTimer( void );
 void updateBuzzerNonBlocking( void );
 int classifySwitchMv(int mv);
 void printSwitchPressedOnce( int ch, int sw );
+int applyVibrato( int baseFreq, uint32_t nowMs );
 
 //---------------------------------------------------------------
 //  ESP32-C6初期化
@@ -93,6 +99,7 @@ void setup() {
   pinMode(DOS5_PIN, INPUT_PULLUP);
   pinMode(RE5_PIN,  INPUT_PULLUP);
   pinMode(MI5_PIN,  INPUT_PULLUP);
+  pinMode(VIB_PIN,  INPUT_PULLUP);
 
   // ADC
   analogReadResolution(12);            // 0..4095 :contentReference[oaicite:5]{index=5}
@@ -198,8 +205,17 @@ void updateBuzzerNonBlocking( void ) {
   if (targetFreq == 0) {
     targetFreq = adcFreq;
   }
-  if (targetFreq != currentFreq) {
-    currentFreq = targetFreq;
+
+  bool vibEnabled = (digitalRead(VIB_PIN) == LOW);
+  int outputFreq = applyVibrato(targetFreq, now);
+
+  if (vibEnabled != lastVibEnabled) {
+    lastVibEnabled = vibEnabled;
+    currentFreq = -1;
+  }
+
+  if (outputFreq != currentFreq) {
+    currentFreq = outputFreq;
     if (currentFreq == 0) {
       ledcWriteTone(BUZZER_PIN, 0);
       ledcWrite(BUZZER_PIN, 0);
@@ -208,6 +224,28 @@ void updateBuzzerNonBlocking( void ) {
       ledcWrite(BUZZER_PIN, 128); // 8bit duty 0..255
     }
   }
+}
+
+//---------------------------------------------------------------
+//  Vibrato
+//---------------------------------------------------------------
+int applyVibrato( int baseFreq, uint32_t nowMs ) {
+  if (baseFreq <= 0) return 0;
+  if (digitalRead(VIB_PIN) != LOW) return baseFreq;
+
+  uint32_t t = nowMs % VIBRATO_PERIOD_MS;
+  uint32_t half = VIBRATO_PERIOD_MS / 2;
+  int32_t lfoPermille = 0;
+
+  if (t < half) {
+    lfoPermille = -1000 + (2000 * (int32_t)t) / (int32_t)half;
+  } else {
+    lfoPermille = 1000 - (2000 * (int32_t)(t - half)) / (int32_t)half;
+  }
+
+  int32_t delta =
+    ((int32_t)baseFreq * VIBRATO_DEPTH_PERMILLE * lfoPermille) / 1000000;
+  return baseFreq + (int)delta;
 }
 
 //---------------------------------------------------------------
