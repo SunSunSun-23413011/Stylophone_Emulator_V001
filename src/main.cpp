@@ -66,6 +66,8 @@ static const uint8_t adcNoteIdx[7][3] = {
 static const uint8_t DIGITAL_NOTE_BASE = 21; // DOS5/RE5/MI5
 static const uint32_t DEFAULT_TEMPO_US_PER_QN = 500000UL;
 static const size_t MAX_SONGS = 32;
+static const uint8_t MIDI_DRUM_CHANNEL = 9;
+static const uint8_t MIDI_CHANNEL_COUNT = 16;
 
 //---------------------------------------------------------------
 //  MIDI用構造体
@@ -84,6 +86,7 @@ struct MidiEvent {
   uint32_t tick;
   uint32_t timeUs;
   uint8_t type;     // MIDI_NOTE_ON / MIDI_NOTE_OFF
+  uint8_t channel;  // 0..15
   uint8_t note;     // 0..127
   uint8_t velocity; // 0..127
 };
@@ -145,12 +148,16 @@ static size_t tempoEventCap = 0;
 
 static uint16_t midiDivision = 480;
 static int loadedSongIndex = -1;
+static int selectedMidiChannel = -1;
+static uint8_t midiChannelPriority[MIDI_CHANNEL_COUNT] = {0};
+static size_t midiChannelPriorityCount = 0;
 
 // MIDI再生状態
 static bool midiIsPlaying = false;
 static size_t midiPlayPos = 0;
 static uint32_t midiPlayStartUs = 0;
-static uint8_t midiActiveNotes[128] = {0};
+static uint8_t midiActiveNotes[MIDI_CHANNEL_COUNT][128] = {{0}};
+static int midiCurrentNoteByChannel[MIDI_CHANNEL_COUNT] = {0};
 static int currentMidiNote = -1;
 static volatile int midiPlaybackFreq = 0;
 static int midiFreqTable[128] = {0};
@@ -182,7 +189,7 @@ void normalizeSpiffsPath(char* dst, size_t dstSize, const char* folder, const ch
 void resetMidiBuffers(void);
 bool reserveMidiEvents(size_t needCount);
 bool reserveTempoEvents(size_t needCount);
-bool appendMidiEvent(uint32_t tick, uint8_t type, uint8_t note, uint8_t velocity);
+bool appendMidiEvent(uint32_t tick, uint8_t type, uint8_t channel, uint8_t note, uint8_t velocity);
 bool appendTempoEvent(uint32_t tick, uint32_t usPerQuarter);
 bool readFileIntoBuffer(const char* path, uint8_t** outBuf, size_t* outLen);
 bool readU16BE(const uint8_t* data, size_t len, size_t* pos, uint16_t* out);
@@ -194,6 +201,7 @@ int cmpMidiEvent(const void* a, const void* b);
 int cmpTempoEvent(const void* a, const void* b);
 bool loadMidiSongByIndex(size_t songIndex);
 
+void resetMidiChannelState(void);
 void startMidiPlayback(void);
 void stopMidiPlayback(void);
 void updateMidiPlayback(void);
@@ -654,6 +662,8 @@ void resetMidiBuffers(void) {
   midiEventCap = 0;
   tempoEventCount = 0;
   tempoEventCap = 0;
+  selectedMidiChannel = -1;
+  midiChannelPriorityCount = 0;
 }
 
 //---------------------------------------------------------------
@@ -691,11 +701,12 @@ bool reserveTempoEvents(size_t needCount) {
 //---------------------------------------------------------------
 //  MIDIイベント追加
 //---------------------------------------------------------------
-bool appendMidiEvent(uint32_t tick, uint8_t type, uint8_t note, uint8_t velocity) {
+bool appendMidiEvent(uint32_t tick, uint8_t type, uint8_t channel, uint8_t note, uint8_t velocity) {
   if (!reserveMidiEvents(midiEventCount + 1)) return false;
   midiEvents[midiEventCount].tick = tick;
   midiEvents[midiEventCount].timeUs = 0;
   midiEvents[midiEventCount].type = type;
+  midiEvents[midiEventCount].channel = channel;
   midiEvents[midiEventCount].note = note;
   midiEvents[midiEventCount].velocity = velocity;
   midiEventCount++;
@@ -803,6 +814,8 @@ bool readVLQ(const uint8_t* data, size_t end, size_t* pos, uint32_t* out) {
 //---------------------------------------------------------------
 bool parseMidiBuffer(const uint8_t* data, size_t len) {
   if (len < 14) return false;
+  selectedMidiChannel = -1;
+  midiChannelPriorityCount = 0;
 
   size_t pos = 0;
   if (memcmp(data + pos, "MThd", 4) != 0) return false;
@@ -828,6 +841,8 @@ bool parseMidiBuffer(const uint8_t* data, size_t len) {
   pos += headerLen;
 
   (void)formatType;
+  uint32_t chNoteOnCount[MIDI_CHANNEL_COUNT] = {0};
+  uint32_t chNoteSum[MIDI_CHANNEL_COUNT] = {0};
 
   if (!appendTempoEvent(0, DEFAULT_TEMPO_US_PER_QN)) {
     return false;
@@ -893,6 +908,7 @@ bool parseMidiBuffer(const uint8_t* data, size_t len) {
       }
 
       uint8_t kind = status & 0xF0;
+      uint8_t channel = status & 0x0F;
       if (kind == 0xC0 || kind == 0xD0) {
         if (trPos + 1 > trEnd) return false;
         trPos += 1;
@@ -901,13 +917,19 @@ bool parseMidiBuffer(const uint8_t* data, size_t len) {
         uint8_t d1 = data[trPos++];
         uint8_t d2 = data[trPos++];
 
+        if (channel == MIDI_DRUM_CHANNEL) {
+          continue;
+        }
+
         if (kind == 0x80) {
-          if (!appendMidiEvent(tick, MIDI_NOTE_OFF, d1, d2)) return false;
+          if (!appendMidiEvent(tick, MIDI_NOTE_OFF, channel, d1, d2)) return false;
         } else if (kind == 0x90) {
           if (d2 == 0) {
-            if (!appendMidiEvent(tick, MIDI_NOTE_OFF, d1, d2)) return false;
+            if (!appendMidiEvent(tick, MIDI_NOTE_OFF, channel, d1, d2)) return false;
           } else {
-            if (!appendMidiEvent(tick, MIDI_NOTE_ON, d1, d2)) return false;
+            if (!appendMidiEvent(tick, MIDI_NOTE_ON, channel, d1, d2)) return false;
+            chNoteOnCount[channel]++;
+            chNoteSum[channel] += d1;
           }
         }
       }
@@ -915,6 +937,36 @@ bool parseMidiBuffer(const uint8_t* data, size_t len) {
 
     pos = trEnd;
   }
+
+  uint64_t chAvgTimes100[MIDI_CHANNEL_COUNT] = {0};
+  for (uint8_t ch = 0; ch < MIDI_CHANNEL_COUNT; ch++) {
+    if (ch == MIDI_DRUM_CHANNEL) continue;
+    uint32_t count = chNoteOnCount[ch];
+    if (count == 0) continue;
+    chAvgTimes100[ch] = ((uint64_t)chNoteSum[ch] * 100ULL + (uint64_t)(count / 2U)) / (uint64_t)count;
+    midiChannelPriority[midiChannelPriorityCount++] = ch;
+  }
+
+  if (midiChannelPriorityCount == 0) {
+    Serial.println("No melody channel found.");
+    return false;
+  }
+
+  for (size_t i = 0; i < midiChannelPriorityCount; i++) {
+    for (size_t j = i + 1; j < midiChannelPriorityCount; j++) {
+      uint8_t a = midiChannelPriority[i];
+      uint8_t b = midiChannelPriority[j];
+      bool bIsHigher =
+        (chAvgTimes100[b] > chAvgTimes100[a]) ||
+        (chAvgTimes100[b] == chAvgTimes100[a] && chNoteOnCount[b] > chNoteOnCount[a]);
+      if (bIsHigher) {
+        uint8_t tmp = midiChannelPriority[i];
+        midiChannelPriority[i] = midiChannelPriority[j];
+        midiChannelPriority[j] = tmp;
+      }
+    }
+  }
+  selectedMidiChannel = (int)midiChannelPriority[0];
 
   if (midiEventCount == 0) {
     Serial.println("No note events in MIDI.");
@@ -1023,17 +1075,31 @@ bool loadMidiSongByIndex(size_t songIndex) {
   loadedSongIndex = (int)songIndex;
   Serial.print("Loaded MIDI: events=");
   Serial.print((int)midiEventCount);
+  Serial.print(" melody_ch=");
+  Serial.print(selectedMidiChannel);
+  Serial.print(" fallback_ch_count=");
+  Serial.print((int)midiChannelPriorityCount);
   Serial.print(" tempo=");
   Serial.println((int)tempoEventCount);
   return true;
 }
 
 //---------------------------------------------------------------
+//  チャンネル状態初期化
+//---------------------------------------------------------------
+void resetMidiChannelState(void) {
+  memset(midiActiveNotes, 0, sizeof(midiActiveNotes));
+  for (uint8_t ch = 0; ch < MIDI_CHANNEL_COUNT; ch++) {
+    midiCurrentNoteByChannel[ch] = -1;
+  }
+  currentMidiNote = -1;
+}
+
+//---------------------------------------------------------------
 //  再生開始
 //---------------------------------------------------------------
 void startMidiPlayback(void) {
-  memset(midiActiveNotes, 0, sizeof(midiActiveNotes));
-  currentMidiNote = -1;
+  resetMidiChannelState();
   midiPlayPos = 0;
   midiPlaybackFreq = 0;
   midiPlayStartUs = micros();
@@ -1047,8 +1113,7 @@ void stopMidiPlayback(void) {
   midiIsPlaying = false;
   midiPlayPos = 0;
   midiPlaybackFreq = 0;
-  currentMidiNote = -1;
-  memset(midiActiveNotes, 0, sizeof(midiActiveNotes));
+  resetMidiChannelState();
 }
 
 //---------------------------------------------------------------
@@ -1064,6 +1129,16 @@ void updateMidiPlayback(void) {
   while (midiPlayPos < midiEventCount && midiEvents[midiPlayPos].timeUs <= elapsedUs) {
     handleMidiEvent(&midiEvents[midiPlayPos]);
     midiPlayPos++;
+  }
+
+  currentMidiNote = -1;
+  for (size_t i = 0; i < midiChannelPriorityCount; i++) {
+    uint8_t ch = midiChannelPriority[i];
+    int note = midiCurrentNoteByChannel[ch];
+    if (note >= 0 && note < 128) {
+      currentMidiNote = note;
+      break;
+    }
   }
 
   if (currentMidiNote >= 0 && currentMidiNote < 128) {
@@ -1082,21 +1157,21 @@ void updateMidiPlayback(void) {
 //---------------------------------------------------------------
 void handleMidiEvent(const MidiEvent* ev) {
   if (ev == nullptr) return;
+  if (ev->channel >= MIDI_CHANNEL_COUNT) return;
   if (ev->note >= 128) return;
+  uint8_t ch = ev->channel;
 
   if (ev->type == MIDI_NOTE_ON) {
-    if (midiActiveNotes[ev->note] < 255) {
-      midiActiveNotes[ev->note]++;
+    if (midiActiveNotes[ch][ev->note] < 255) {
+      midiActiveNotes[ch][ev->note]++;
     }
-    currentMidiNote = ev->note;
+    midiCurrentNoteByChannel[ch] = ev->note;
   } else {
-    if (midiActiveNotes[ev->note] > 0) {
-      midiActiveNotes[ev->note]--;
+    if (midiActiveNotes[ch][ev->note] > 0) {
+      midiActiveNotes[ch][ev->note]--;
     }
-    if (currentMidiNote == ev->note && midiActiveNotes[ev->note] == 0) {
-      // Monophonic behavior: when the current note is released, stop sound.
-      // This avoids resurrecting older sustained notes that make playback sound stretched.
-      currentMidiNote = -1;
+    if (midiCurrentNoteByChannel[ch] == ev->note && midiActiveNotes[ch][ev->note] == 0) {
+      midiCurrentNoteByChannel[ch] = -1;
     }
   }
 }
