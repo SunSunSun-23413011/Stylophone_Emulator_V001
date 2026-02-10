@@ -31,6 +31,7 @@
 //  ポート定義
 //-------------------------------------------------------------------------
 #define SW_ADC_PIN 0   // GPIO0 = ADC1_CH0
+#define SPEAKER_PIN 20
 #define BUZZER_PIN 7
 #define VIB_PIN    10
 #define MODE_PIN   11
@@ -126,7 +127,8 @@ struct TempoEvent {
 //  グローバル変数定義
 //---------------------------------------------------------------
 const uint32_t DEBOUNCE_MS = 10;
-int currentFreq = -1;
+int currentSpeakerFreq = -1;
+int currentBuzzerFreq = -1;
 static bool lastVibEnabled = false;
 static bool songMode = false;
 
@@ -177,6 +179,7 @@ static size_t tempoEventCap = 0;
 static uint16_t midiDivision = 480;
 static int loadedSongIndex = -1;
 static int selectedMidiChannel = -1;
+static int selectedMidiBuzzerChannel = -1;
 static uint8_t midiChannelPriority[MIDI_CHANNEL_COUNT] = {0};
 static size_t midiChannelPriorityCount = 0;
 
@@ -187,8 +190,10 @@ static uint32_t midiPlayLastRealUs = 0;
 static uint64_t midiPlayElapsedSongUs = 0;
 static uint8_t midiActiveNotes[MIDI_CHANNEL_COUNT][128] = {{0}};
 static int midiCurrentNoteByChannel[MIDI_CHANNEL_COUNT] = {0};
-static int currentMidiNote = -1;
-static volatile int midiPlaybackFreq = 0;
+static int currentMidiSpeakerNote = -1;
+static int currentMidiBuzzerNote = -1;
+static volatile int midiSpeakerPlaybackFreq = 0;
+static volatile int midiBuzzerPlaybackFreq = 0;
 static int midiFreqTable[128] = {0};
 
 // Audio再生状態
@@ -207,7 +212,6 @@ static uint32_t speedLastChangeMs = 0;
 //---------------------------------------------------------------
 //  関数プロトタイプ宣言
 //---------------------------------------------------------------
-int freqFromButtons(uint8_t raw);
 void ARDUINO_ISR_ATTR onTimer(void);
 void processAdcKeys(void);
 void updateBuzzerNonBlocking(void);
@@ -219,6 +223,10 @@ int consumeKeyPress(void);
 int classifySwitchMv(int mv);
 void printSwitchPressedOnce(int ch, int sw);
 int applyVibrato(int baseFreq, uint32_t nowMs);
+void updateToneOutput(uint8_t pin, int targetFreq, int* currentFreqState);
+size_t collectKeyboardFrequencies(uint8_t raw, int* outFreq, size_t maxCount);
+int findActiveMidiNoteFromRank(size_t startRank);
+bool hasAnyActiveMidiNote(void);
 
 void buildMidiFreqTable(void);
 bool initSpiffsAndSongList(void);
@@ -267,6 +275,7 @@ void setup() {
   Serial.begin(115200);
 
   // LEDC
+  ledcAttach(SPEAKER_PIN, 2000, 8);
   ledcAttach(BUZZER_PIN, 2000, 8);
 
   pinMode(DOS5_PIN, INPUT_PULLUP);
@@ -314,7 +323,8 @@ void loop() {
   if (songMode) {
     processSongModeLogic();
   } else {
-    midiPlaybackFreq = 0;
+    midiSpeakerPlaybackFreq = 0;
+    midiBuzzerPlaybackFreq = 0;
     if (audioIsPlaying) {
       stopAudioPlayback();
     }
@@ -341,7 +351,8 @@ void handleModeChange(bool nextSongMode) {
     selectedSongIndex = -1;
     setActiveSongSpeedByIndex(-1);
   }
-  currentFreq = -1;
+  currentSpeakerFreq = -1;
+  currentBuzzerFreq = -1;
 }
 
 //---------------------------------------------------------------
@@ -452,14 +463,60 @@ int consumeKeyPress(void) {
 }
 
 //---------------------------------------------------------------
-//  デジタル3ボタン監視(返値=周波数)
+//  ピン出力更新
 //---------------------------------------------------------------
-int freqFromButtons(uint8_t raw) {
+void updateToneOutput(uint8_t pin, int targetFreq, int* currentFreqState) {
+  if (currentFreqState == nullptr) return;
+  if (targetFreq < 0) targetFreq = 0;
+  if (*currentFreqState == targetFreq) return;
+
+  *currentFreqState = targetFreq;
+  if (targetFreq == 0) {
+    ledcWriteTone(pin, 0);
+    ledcWrite(pin, 0);
+  } else {
+    ledcWriteTone(pin, targetFreq);
+    ledcWrite(pin, 128); // 8bit duty 0..255
+  }
+}
+
+//---------------------------------------------------------------
+//  鍵盤入力を周波数配列へ変換(高い音を先頭に並べる)
+//---------------------------------------------------------------
+size_t collectKeyboardFrequencies(uint8_t raw, int* outFreq, size_t maxCount) {
+  if (outFreq == nullptr || maxCount == 0) return 0;
+
+  size_t count = 0;
+  auto appendFreq = [&](int freq) {
+    if (freq <= 0) return;
+    if (count >= maxCount) return;
+    outFreq[count++] = freq;
+  };
+
   // INPUT_PULLUPなので押下=0
-  if ((raw & (1 << 0)) == 0) return melody[21]; // Do#5
-  if ((raw & (1 << 1)) == 0) return melody[22]; // Re5
-  if ((raw & (1 << 2)) == 0) return melody[23]; // Mi5
-  return 0;
+  if ((raw & (1 << 0)) == 0) appendFreq(melody[21]); // Do#5
+  if ((raw & (1 << 1)) == 0) appendFreq(melody[22]); // Re5
+  if ((raw & (1 << 2)) == 0) appendFreq(melody[23]); // Mi5
+
+  for (int ch = 0; ch < chMax; ch++) {
+    int sw = swStable[ch];
+    if (sw >= 0 && sw <= 2) {
+      appendFreq(melody[adcNoteIdx[ch][sw]]);
+    }
+  }
+
+  // 高音順(降順)に整列
+  for (size_t i = 0; i < count; i++) {
+    for (size_t j = i + 1; j < count; j++) {
+      if (outFreq[j] > outFreq[i]) {
+        int tmp = outFreq[i];
+        outFreq[i] = outFreq[j];
+        outFreq[j] = tmp;
+      }
+    }
+  }
+
+  return count;
 }
 
 //---------------------------------------------------------------
@@ -503,42 +560,39 @@ void updateBuzzerNonBlocking(void) {
   }
 
   if (songMode && audioIsPlaying) {
-    if (currentFreq != 0) {
-      currentFreq = 0;
-      ledcWriteTone(BUZZER_PIN, 0);
-      ledcWrite(BUZZER_PIN, 0);
-    }
+    updateToneOutput(SPEAKER_PIN, 0, &currentSpeakerFreq);
+    updateToneOutput(BUZZER_PIN, 0, &currentBuzzerFreq);
     return;
   }
 
-  int targetFreq = 0;
-  if (songMode) {
-    targetFreq = midiPlaybackFreq;
-  } else {
-    targetFreq = freqFromButtons(stableRaw);
-    if (targetFreq == 0) {
-      targetFreq = adcFreq;
-    }
-  }
-
   bool vibEnabled = (digitalRead(VIB_PIN) == LOW);
-  int outputFreq = applyVibrato(targetFreq, now);
-
   if (vibEnabled != lastVibEnabled) {
     lastVibEnabled = vibEnabled;
-    currentFreq = -1;
+    currentSpeakerFreq = -1;
+    currentBuzzerFreq = -1;
   }
 
-  if (outputFreq != currentFreq) {
-    currentFreq = outputFreq;
-    if (currentFreq == 0) {
-      ledcWriteTone(BUZZER_PIN, 0);
-      ledcWrite(BUZZER_PIN, 0);
-    } else {
-      ledcWriteTone(BUZZER_PIN, currentFreq);
-      ledcWrite(BUZZER_PIN, 128); // 8bit duty 0..255
+  int speakerTargetFreq = 0;
+  int buzzerTargetFreq = 0;
+  if (songMode) {
+    speakerTargetFreq = midiSpeakerPlaybackFreq;
+    buzzerTargetFreq = midiBuzzerPlaybackFreq;
+  } else {
+    int keyFreq[10] = {0};
+    size_t keyCount = collectKeyboardFrequencies(stableRaw, keyFreq, sizeof(keyFreq) / sizeof(keyFreq[0]));
+    if (keyCount >= 1) {
+      speakerTargetFreq = keyFreq[0];
+    }
+    if (keyCount >= 2) {
+      buzzerTargetFreq = keyFreq[1];
     }
   }
+
+  int speakerOutputFreq = applyVibrato(speakerTargetFreq, now);
+  int buzzerOutputFreq = applyVibrato(buzzerTargetFreq, now);
+
+  updateToneOutput(SPEAKER_PIN, speakerOutputFreq, &currentSpeakerFreq);
+  updateToneOutput(BUZZER_PIN, buzzerOutputFreq, &currentBuzzerFreq);
 }
 
 //---------------------------------------------------------------
@@ -993,7 +1047,7 @@ static bool ensureAudioOutput(void) {
     return false;
   }
 
-  audioOutput->SetPinout(AUDIO_I2S_BCLK_PIN, AUDIO_I2S_WCLK_PIN, BUZZER_PIN);
+  audioOutput->SetPinout(AUDIO_I2S_BCLK_PIN, AUDIO_I2S_WCLK_PIN, SPEAKER_PIN);
   audioOutput->SetOutputModeMono(true);
   audioOutput->SetGain(0.18f);
   return true;
@@ -1021,11 +1075,15 @@ void stopAudioPlayback(void) {
     audioOutput->stop();
   }
 
-  // Audio(I2S)で奪ったBUZZERピンをLEDCへ戻す
+  // Audio(I2S)で奪ったSPEAKER/BUZZERピンをLEDCへ戻す
+  ledcAttach(SPEAKER_PIN, 2000, 8);
   ledcAttach(BUZZER_PIN, 2000, 8);
+  ledcWriteTone(SPEAKER_PIN, 0);
+  ledcWrite(SPEAKER_PIN, 0);
   ledcWriteTone(BUZZER_PIN, 0);
   ledcWrite(BUZZER_PIN, 0);
-  currentFreq = -1;
+  currentSpeakerFreq = -1;
+  currentBuzzerFreq = -1;
 
   loadedAudioSongIndex = -1;
 }
@@ -1077,7 +1135,8 @@ bool startAudioSongByIndex(size_t songIndex) {
 
   audioIsPlaying = true;
   loadedAudioSongIndex = (int)songIndex;
-  midiPlaybackFreq = 0;
+  midiSpeakerPlaybackFreq = 0;
+  midiBuzzerPlaybackFreq = 0;
   return true;
 }
 
@@ -1109,6 +1168,7 @@ void resetMidiBuffers(void) {
   tempoEventCount = 0;
   tempoEventCap = 0;
   selectedMidiChannel = -1;
+  selectedMidiBuzzerChannel = -1;
   midiChannelPriorityCount = 0;
 }
 
@@ -1261,6 +1321,7 @@ bool readVLQ(const uint8_t* data, size_t end, size_t* pos, uint32_t* out) {
 bool parseMidiBuffer(const uint8_t* data, size_t len) {
   if (len < 14) return false;
   selectedMidiChannel = -1;
+  selectedMidiBuzzerChannel = -1;
   midiChannelPriorityCount = 0;
 
   size_t pos = 0;
@@ -1435,6 +1496,11 @@ bool parseMidiBuffer(const uint8_t* data, size_t len) {
     }
   }
   selectedMidiChannel = (int)midiChannelPriority[0];
+  if (midiChannelPriorityCount >= 2) {
+    selectedMidiBuzzerChannel = (int)midiChannelPriority[1];
+  } else {
+    selectedMidiBuzzerChannel = -1;
+  }
 
   if (midiEventCount == 0) {
     Serial.println("No note events in MIDI.");
@@ -1540,6 +1606,8 @@ bool loadMidiSongByIndex(size_t songIndex) {
   Serial.print((int)midiEventCount);
   Serial.print(" melody_ch=");
   Serial.print(selectedMidiChannel);
+  Serial.print(" buzzer_ch=");
+  Serial.print(selectedMidiBuzzerChannel);
   Serial.print(" fallback_ch_count=");
   Serial.print((int)midiChannelPriorityCount);
   Serial.print(" tempo=");
@@ -1548,14 +1616,45 @@ bool loadMidiSongByIndex(size_t songIndex) {
 }
 
 //---------------------------------------------------------------
-//  チャンネル状態初期化
+//  優先順位から現在の発音ノート取得
+//---------------------------------------------------------------
+int findActiveMidiNoteFromRank(size_t startRank) {
+  if (startRank >= midiChannelPriorityCount) return -1;
+
+  for (size_t i = startRank; i < midiChannelPriorityCount; i++) {
+    uint8_t ch = midiChannelPriority[i];
+    int note = midiCurrentNoteByChannel[ch];
+    if (note >= 0 && note < 128) {
+      return note;
+    }
+  }
+  return -1;
+}
+
+//---------------------------------------------------------------
+//  いずれかの優先チャンネルで発音中か
+//---------------------------------------------------------------
+bool hasAnyActiveMidiNote(void) {
+  for (size_t i = 0; i < midiChannelPriorityCount; i++) {
+    uint8_t ch = midiChannelPriority[i];
+    int note = midiCurrentNoteByChannel[ch];
+    if (note >= 0 && note < 128) {
+      return true;
+    }
+  }
+  return false;
+}
+
+//---------------------------------------------------------------
+//  MIDIチャンネル状態初期化
 //---------------------------------------------------------------
 void resetMidiChannelState(void) {
   memset(midiActiveNotes, 0, sizeof(midiActiveNotes));
   for (uint8_t ch = 0; ch < MIDI_CHANNEL_COUNT; ch++) {
     midiCurrentNoteByChannel[ch] = -1;
   }
-  currentMidiNote = -1;
+  currentMidiSpeakerNote = -1;
+  currentMidiBuzzerNote = -1;
 }
 
 //---------------------------------------------------------------
@@ -1564,7 +1663,8 @@ void resetMidiChannelState(void) {
 void startMidiPlayback(void) {
   resetMidiChannelState();
   midiPlayPos = 0;
-  midiPlaybackFreq = 0;
+  midiSpeakerPlaybackFreq = 0;
+  midiBuzzerPlaybackFreq = 0;
   midiPlayElapsedSongUs = 0;
   midiPlayLastRealUs = micros();
   midiIsPlaying = (midiEventCount > 0);
@@ -1576,7 +1676,8 @@ void startMidiPlayback(void) {
 void stopMidiPlayback(void) {
   midiIsPlaying = false;
   midiPlayPos = 0;
-  midiPlaybackFreq = 0;
+  midiSpeakerPlaybackFreq = 0;
+  midiBuzzerPlaybackFreq = 0;
   midiPlayElapsedSongUs = 0;
   midiPlayLastRealUs = 0;
   resetMidiChannelState();
@@ -1587,7 +1688,8 @@ void stopMidiPlayback(void) {
 //---------------------------------------------------------------
 void updateMidiPlayback(void) {
   if (!midiIsPlaying || midiEventCount == 0) {
-    midiPlaybackFreq = 0;
+    midiSpeakerPlaybackFreq = 0;
+    midiBuzzerPlaybackFreq = 0;
     return;
   }
 
@@ -1607,23 +1709,24 @@ void updateMidiPlayback(void) {
     midiPlayPos++;
   }
 
-  currentMidiNote = -1;
-  for (size_t i = 0; i < midiChannelPriorityCount; i++) {
-    uint8_t ch = midiChannelPriority[i];
-    int note = midiCurrentNoteByChannel[ch];
-    if (note >= 0 && note < 128) {
-      currentMidiNote = note;
-      break;
-    }
-  }
+  // 1位チャンネル(0)はSPEAKER、2位チャンネル(1)はBUZZER。
+  // 休符時は、それぞれより下位のチャンネルを順に参照する。
+  currentMidiSpeakerNote = findActiveMidiNoteFromRank(0);
+  currentMidiBuzzerNote = findActiveMidiNoteFromRank(1);
 
-  if (currentMidiNote >= 0 && currentMidiNote < 128) {
-    midiPlaybackFreq = midiFreqTable[currentMidiNote];
+  if (currentMidiSpeakerNote >= 0 && currentMidiSpeakerNote < 128) {
+    midiSpeakerPlaybackFreq = midiFreqTable[currentMidiSpeakerNote];
   } else {
-    midiPlaybackFreq = 0;
+    midiSpeakerPlaybackFreq = 0;
   }
 
-  if (midiPlayPos >= midiEventCount && currentMidiNote < 0) {
+  if (currentMidiBuzzerNote >= 0 && currentMidiBuzzerNote < 128) {
+    midiBuzzerPlaybackFreq = midiFreqTable[currentMidiBuzzerNote];
+  } else {
+    midiBuzzerPlaybackFreq = 0;
+  }
+
+  if (midiPlayPos >= midiEventCount && !hasAnyActiveMidiNote()) {
     midiIsPlaying = false;
   }
 }
@@ -1647,7 +1750,14 @@ void handleMidiEvent(const MidiEvent* ev) {
       midiActiveNotes[ch][ev->note]--;
     }
     if (midiCurrentNoteByChannel[ch] == ev->note && midiActiveNotes[ch][ev->note] == 0) {
-      midiCurrentNoteByChannel[ch] = -1;
+      int fallbackNote = -1;
+      for (int note = 127; note >= 0; note--) {
+        if (midiActiveNotes[ch][note] > 0) {
+          fallbackNote = note;
+          break;
+        }
+      }
+      midiCurrentNoteByChannel[ch] = fallbackNote;
     }
   }
 }
