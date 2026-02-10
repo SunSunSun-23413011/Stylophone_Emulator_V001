@@ -82,6 +82,10 @@ static const uint16_t MIDI_SPEED_MIN_PERMILLE = 250;   // 0.25x
 static const uint16_t MIDI_SPEED_MAX_PERMILLE = 4000;  // 4.00x
 static const uint16_t MIDI_SPEED_STEP_PERMILLE = 100;  // 0.10x step
 static const char* const MIDI_SPEED_STORE_PATH = "/midi_speed.cfg";
+static const uint8_t SPEAKER_LEDC_CHANNEL = 0;
+static const uint8_t BUZZER_LEDC_CHANNEL = 1;
+static const uint32_t TONE_PWM_BASE_FREQ = 2000;
+static const uint8_t TONE_PWM_RESOLUTION = 8;
 
 //---------------------------------------------------------------
 //  MIDI用構造体
@@ -223,8 +227,13 @@ int consumeKeyPress(void);
 int classifySwitchMv(int mv);
 void printSwitchPressedOnce(int ch, int sw);
 int applyVibrato(int baseFreq, uint32_t nowMs);
+bool initTonePwmOutputs(void);
 void updateToneOutput(uint8_t pin, int targetFreq, int* currentFreqState);
 size_t collectKeyboardFrequencies(uint8_t raw, int* outFreq, size_t maxCount);
+int findHighestActiveMidiNoteInChannel(uint8_t channel);
+int findLowestActiveMidiNoteInChannel(uint8_t channel);
+uint8_t countActiveMidiNotesInChannel(uint8_t channel);
+int findAlternateActiveMidiNoteInChannel(uint8_t channel, int excludeNote);
 int findActiveMidiNoteFromRank(size_t startRank);
 bool hasAnyActiveMidiNote(void);
 
@@ -275,8 +284,7 @@ void setup() {
   Serial.begin(115200);
 
   // LEDC
-  ledcAttach(SPEAKER_PIN, 2000, 8);
-  ledcAttach(BUZZER_PIN, 2000, 8);
+  initTonePwmOutputs();
 
   pinMode(DOS5_PIN, INPUT_PULLUP);
   pinMode(RE5_PIN,  INPUT_PULLUP);
@@ -460,6 +468,25 @@ int consumeKeyPress(void) {
   int key = pendingKeyPress;
   pendingKeyPress = -1;
   return key;
+}
+
+//---------------------------------------------------------------
+//  Tone用LEDC初期化(2ピンを別チャネルに固定)
+//---------------------------------------------------------------
+bool initTonePwmOutputs(void) {
+  bool okSpeaker = ledcAttachChannel(SPEAKER_PIN, TONE_PWM_BASE_FREQ, TONE_PWM_RESOLUTION, SPEAKER_LEDC_CHANNEL);
+  bool okBuzzer = ledcAttachChannel(BUZZER_PIN, TONE_PWM_BASE_FREQ, TONE_PWM_RESOLUTION, BUZZER_LEDC_CHANNEL);
+  if (!okSpeaker || !okBuzzer) {
+    Serial.println("LEDC attach failed.");
+  }
+
+  ledcWriteTone(SPEAKER_PIN, 0);
+  ledcWrite(SPEAKER_PIN, 0);
+  ledcWriteTone(BUZZER_PIN, 0);
+  ledcWrite(BUZZER_PIN, 0);
+  currentSpeakerFreq = -1;
+  currentBuzzerFreq = -1;
+  return okSpeaker && okBuzzer;
 }
 
 //---------------------------------------------------------------
@@ -1076,14 +1103,7 @@ void stopAudioPlayback(void) {
   }
 
   // Audio(I2S)で奪ったSPEAKER/BUZZERピンをLEDCへ戻す
-  ledcAttach(SPEAKER_PIN, 2000, 8);
-  ledcAttach(BUZZER_PIN, 2000, 8);
-  ledcWriteTone(SPEAKER_PIN, 0);
-  ledcWrite(SPEAKER_PIN, 0);
-  ledcWriteTone(BUZZER_PIN, 0);
-  ledcWrite(BUZZER_PIN, 0);
-  currentSpeakerFreq = -1;
-  currentBuzzerFreq = -1;
+  initTonePwmOutputs();
 
   loadedAudioSongIndex = -1;
 }
@@ -1616,6 +1636,62 @@ bool loadMidiSongByIndex(size_t songIndex) {
 }
 
 //---------------------------------------------------------------
+//  指定チャンネルの最高発音ノート取得
+//---------------------------------------------------------------
+int findHighestActiveMidiNoteInChannel(uint8_t channel) {
+  if (channel >= MIDI_CHANNEL_COUNT) return -1;
+  for (int note = 127; note >= 0; note--) {
+    if (midiActiveNotes[channel][note] > 0) {
+      return note;
+    }
+  }
+  return -1;
+}
+
+//---------------------------------------------------------------
+//  指定チャンネルの最低発音ノート取得
+//---------------------------------------------------------------
+int findLowestActiveMidiNoteInChannel(uint8_t channel) {
+  if (channel >= MIDI_CHANNEL_COUNT) return -1;
+  for (int note = 0; note < 128; note++) {
+    if (midiActiveNotes[channel][note] > 0) {
+      return note;
+    }
+  }
+  return -1;
+}
+
+//---------------------------------------------------------------
+//  指定チャンネルで同時発音中のユニークノート数
+//---------------------------------------------------------------
+uint8_t countActiveMidiNotesInChannel(uint8_t channel) {
+  if (channel >= MIDI_CHANNEL_COUNT) return 0;
+  uint8_t count = 0;
+  for (int note = 0; note < 128; note++) {
+    if (midiActiveNotes[channel][note] > 0) {
+      if (count < 255) count++;
+    }
+  }
+  return count;
+}
+
+//---------------------------------------------------------------
+//  指定チャンネルで除外ノート以外の発音ノート取得
+//---------------------------------------------------------------
+int findAlternateActiveMidiNoteInChannel(uint8_t channel, int excludeNote) {
+  if (channel >= MIDI_CHANNEL_COUNT) return -1;
+
+  for (int note = 127; note >= 0; note--) {
+    if (note == excludeNote) continue;
+    if (midiActiveNotes[channel][note] > 0) {
+      return note;
+    }
+  }
+
+  return -1;
+}
+
+//---------------------------------------------------------------
 //  優先順位から現在の発音ノート取得
 //---------------------------------------------------------------
 int findActiveMidiNoteFromRank(size_t startRank) {
@@ -1637,9 +1713,10 @@ int findActiveMidiNoteFromRank(size_t startRank) {
 bool hasAnyActiveMidiNote(void) {
   for (size_t i = 0; i < midiChannelPriorityCount; i++) {
     uint8_t ch = midiChannelPriority[i];
-    int note = midiCurrentNoteByChannel[ch];
-    if (note >= 0 && note < 128) {
-      return true;
+    for (int note = 0; note < 128; note++) {
+      if (midiActiveNotes[ch][note] > 0) {
+        return true;
+      }
     }
   }
   return false;
@@ -1709,10 +1786,22 @@ void updateMidiPlayback(void) {
     midiPlayPos++;
   }
 
-  // 1位チャンネル(0)はSPEAKER、2位チャンネル(1)はBUZZER。
+  // 通常は1位チャンネル(0)をSPEAKER、2位チャンネル(1)をBUZZERへ割当。
   // 休符時は、それぞれより下位のチャンネルを順に参照する。
-  currentMidiSpeakerNote = findActiveMidiNoteFromRank(0);
-  currentMidiBuzzerNote = findActiveMidiNoteFromRank(1);
+  // ただし有効チャンネルが1つだけのときは、音が重なった瞬間だけBUZZERを使う。
+  if (midiChannelPriorityCount == 1) {
+    uint8_t ch = midiChannelPriority[0];
+    // 単一チャンネル時は再生順に依らず常に低音を優先する
+    currentMidiSpeakerNote = findLowestActiveMidiNoteInChannel(ch);
+
+    currentMidiBuzzerNote = -1;
+    if (countActiveMidiNotesInChannel(ch) >= 2 && currentMidiSpeakerNote >= 0) {
+      currentMidiBuzzerNote = findAlternateActiveMidiNoteInChannel(ch, currentMidiSpeakerNote);
+    }
+  } else {
+    currentMidiSpeakerNote = findActiveMidiNoteFromRank(0);
+    currentMidiBuzzerNote = findActiveMidiNoteFromRank(1);
+  }
 
   if (currentMidiSpeakerNote >= 0 && currentMidiSpeakerNote < 128) {
     midiSpeakerPlaybackFreq = midiFreqTable[currentMidiSpeakerNote];
